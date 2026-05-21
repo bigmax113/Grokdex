@@ -1,0 +1,5 @@
+node_modules/
+.env
+.render-workspace/
+sessions/
+logs/
