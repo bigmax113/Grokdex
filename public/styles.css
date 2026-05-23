@@ -177,7 +177,7 @@ button:disabled {
 .chat {
   min-height: 0;
   display: grid;
-  grid-template-rows: 1fr auto;
+  grid-template-rows: 1fr auto auto auto;
   padding: 16px;
   gap: 12px;
 }
@@ -197,6 +197,62 @@ pre {
 .remoteForm {
   display: grid;
   gap: 10px;
+}
+
+.runStatus {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid #b7d8ff;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: #eef6ff;
+  color: #184e77;
+  font-size: 13px;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #9cc9f5;
+  border-top-color: #0b7a75;
+  border-radius: 999px;
+  animation: spin 0.85s linear infinite;
+  flex: 0 0 auto;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.downloadBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid #9ad9d0;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.downloadBar a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border: 1px solid #80cbc2;
+  border-radius: 999px;
+  padding: 3px 9px;
+  color: var(--accent);
+  background: #fff;
+  text-decoration: none;
+  font-weight: 700;
 }
 
 .composerActions {

@@ -10,6 +10,32 @@ function setRemoteStatus(text) {
   $("remoteStatus").textContent = text || "";
 }
 
+function setRunStatus(text, active = true) {
+  const box = $("runStatus");
+  $("runStatusText").textContent = text || "";
+  box.classList.toggle("hidden", !text);
+  box.querySelector(".spinner").classList.toggle("hidden", !active);
+}
+
+function clearDownloadLinks() {
+  $("downloadBar").innerHTML = "";
+  $("downloadBar").classList.add("hidden");
+}
+
+function showDownloadLinks(files) {
+  const useful = (files || []).filter((file) => file.downloadUrl && file.name !== "transcript.txt");
+  if (!useful.length) return;
+  const preferred = useful.find((file) => file.name === "results.zip") || useful[0];
+  const links = useful.map((file) => {
+    const label = file.name === preferred.name
+      ? `Download ${file.name}`
+      : `${file.name} (${formatBytes(file.size)})`;
+    return `<a href="${escapeHtml(file.downloadUrl)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`;
+  }).join("");
+  $("downloadBar").innerHTML = `<strong>Result:</strong> ${links}`;
+  $("downloadBar").classList.remove("hidden");
+}
+
 function append(text) {
   const output = $("output");
   output.textContent += text;
@@ -109,11 +135,29 @@ async function readEventStream(response) {
       const event = frame.match(/^event: (.+)$/m)?.[1] || "message";
       const raw = frame.match(/^data: (.+)$/m)?.[1] || "{}";
       const data = JSON.parse(raw);
-      if (event === "token" || event === "stderr") append(data.token || "");
-      if (event === "meta" && data.taskId) setRemoteStatus(`Task ${data.taskId} queued.`);
-      if (event === "log") setRemoteStatus(data.message || "");
-      if (event === "error") append(`\nERROR: ${data.error}\n`);
-      if (event === "done") setRemoteStatus(data.code === 0 ? "Done." : `Exit ${data.code}`);
+      if (event === "token" || event === "stderr") {
+        setRunStatus("Receiving model output...");
+        append(data.token || "");
+      }
+      if (event === "meta" && data.taskId) {
+        setRunStatus(`Queued: ${data.taskId}`);
+        setRemoteStatus(`Task ${data.taskId} queued.`);
+      }
+      if (event === "log") {
+        const message = data.message || "";
+        if (/claimed/i.test(message)) setRunStatus("Local worker claimed the task...");
+        else if (/saved .*input/i.test(message)) setRunStatus("Preparing uploaded files...");
+        else if (/continue started/i.test(message)) setRunStatus("LM Studio is processing...");
+        else if (/image|vision/i.test(message)) setRunStatus(message);
+        else setRunStatus("Working...");
+        setRemoteStatus(message);
+      }
+      if (event === "result") showDownloadLinks(data.files || []);
+      if (event === "error") {
+        setRunStatus("Failed.", false);
+        append(`\nERROR: ${data.error}\n`);
+      }
+      if (event === "done") setRunStatus(data.code === 0 ? "Done." : `Exit ${data.code}`, false);
     }
   }
 }
@@ -122,13 +166,17 @@ async function runAgent(event) {
   event.preventDefault();
   const prompt = $("prompt").value.trim();
   if (!prompt || currentRunId) return;
+  const selected = selectedRemoteInputs();
   currentRunId = `ui-${Date.now().toString(36)}`;
   controller = new AbortController();
   $("send").disabled = true;
   $("stop").disabled = false;
+  clearDownloadLinks();
+  setRunStatus(selected.length ? `Uploading ${selected.length} file(s)...` : "Creating task...");
   append(`\n> ${prompt}\n`);
   $("prompt").value = "";
   try {
+    const files = await buildUploadFiles(selected);
     const response = await fetch("/api/agent", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -136,8 +184,9 @@ async function runAgent(event) {
       body: JSON.stringify({
         runId: currentRunId,
         prompt,
-        model: "grok-build",
+        localModel: $("remoteModel").value,
         auto: $("auto").checked,
+        files,
       }),
     });
     if (!response.ok) {
@@ -145,8 +194,13 @@ async function runAgent(event) {
       if (response.status === 401) await refreshMe().catch(() => {});
       throw new Error(data.error || response.statusText);
     }
+    if (selected.length) {
+      $("remoteFiles").value = "";
+      $("remoteFolder").value = "";
+    }
     await readEventStream(response);
   } catch (error) {
+    setRunStatus(error.name === "AbortError" ? "Stopped." : "Failed.", false);
     append(error.name === "AbortError" ? "\n[stopped]\n" : `\nERROR: ${error.message}\n`);
   } finally {
     currentRunId = null;
@@ -225,27 +279,36 @@ function fileToBase64(file) {
   });
 }
 
-async function createRemoteTask(event) {
-  event.preventDefault();
-  const prompt = $("remotePrompt").value.trim();
-  const selected = [
+function selectedRemoteInputs() {
+  return [
     ...Array.from($("remoteFiles").files || []),
     ...Array.from($("remoteFolder").files || []),
   ];
+}
+
+async function buildUploadFiles(files) {
+  const uploads = [];
+  for (const file of files) {
+    uploads.push({
+      name: file.name,
+      relativePath: file.webkitRelativePath || file.name,
+      mime: file.type || "application/octet-stream",
+      base64: await fileToBase64(file),
+    });
+  }
+  return uploads;
+}
+
+async function createRemoteTask(event) {
+  event.preventDefault();
+  const prompt = $("remotePrompt").value.trim();
+  const selected = selectedRemoteInputs();
   if (!prompt && !selected.length) return;
 
   $("createRemoteTask").disabled = true;
   setRemoteStatus("Uploading job...");
   try {
-    const files = [];
-    for (const file of selected) {
-      files.push({
-        name: file.name,
-        relativePath: file.webkitRelativePath || file.name,
-        mime: file.type || "application/octet-stream",
-        base64: await fileToBase64(file),
-      });
-    }
+    const files = await buildUploadFiles(selected);
     await api("/api/remote/tasks", {
       method: "POST",
       body: JSON.stringify({ prompt, model: $("remoteModel").value, files }),
@@ -269,7 +332,7 @@ function renderTask(task) {
   const pipeline = task.pipeline?.xliffTranslationRequired ? `<div class="muted">Pipeline: XLIFF translation required</div>` : "";
   const inputs = (task.files || []).map((file) => `<span>${escapeHtml(file.relativePath || file.name)} (${formatBytes(file.size)})</span>`).join("");
   const results = (task.resultFiles || [])
-    .map((file) => `<a href="${file.downloadUrl}">${escapeHtml(file.name)} (${formatBytes(file.size)})</a>`)
+    .map((file) => `<a href="${file.downloadUrl}" target="_blank" rel="noopener">${escapeHtml(file.name)} (${formatBytes(file.size)})</a>`)
     .join("");
   const logs = (task.logs || []).slice(-4).map((log) => `<div>${escapeHtml(log.message)}</div>`).join("");
   return `

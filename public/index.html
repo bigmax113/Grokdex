@@ -40,6 +40,11 @@
         <section class="workbench">
           <section class="chat">
             <pre id="output"></pre>
+            <div id="runStatus" class="runStatus hidden">
+              <span class="spinner" aria-hidden="true"></span>
+              <span id="runStatusText">Idle</span>
+            </div>
+            <div id="downloadBar" class="downloadBar hidden"></div>
             <form id="promptForm" class="composer">
               <textarea id="prompt" rows="5" placeholder="Ask through the local worker..."></textarea>
               <div class="composerActions">

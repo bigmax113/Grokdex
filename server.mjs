@@ -1975,7 +1975,7 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
     task = await createRemoteTaskRecord(session, {
       prompt,
       model: body.localModel || body.provider || "qwen",
-      files: [],
+      files: Array.isArray(body.files) ? body.files : [],
     });
   } catch (error) {
     json(res, 400, { error: error.message });
@@ -2029,6 +2029,14 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
           const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
           if (displayed) sse(res, "token", { token: `\n${displayed}\n` });
         }
+        const files = (current.resultFiles || []).map((file) => ({
+          id: file.id,
+          name: file.name,
+          mime: file.mime,
+          size: file.size,
+          downloadUrl: publicUrl(req, file.downloadUrl || `/api/remote/tasks/${encodeURIComponent(current.id)}/download?file=${encodeURIComponent(file.id)}`),
+        }));
+        if (files.length) sse(res, "result", { files });
         sse(res, "done", { code: 0 });
         res.end();
         return;

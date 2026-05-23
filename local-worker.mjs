@@ -33,6 +33,7 @@ const taskTimeoutMs = Number(process.env.REMOTE_WORKER_TASK_TIMEOUT_MS || 2 * 60
 const accessFile = path.resolve(process.env.REMOTE_WORKER_ACCESS_FILE || path.join(__dirname, "remote-access.enabled"));
 const lmStudioAdminBase = String(process.env.LMSTUDIO_ADMIN_BASE || "http://127.0.0.1:1234/api/v1").replace(/\/+$/, "");
 const lmStudioSwitchBase = String(process.env.LMSTUDIO_SWITCH_BASE || "http://127.0.0.1:1235/v1").replace(/\/+$/, "");
+const lmStudioVisionModel = process.env.REMOTE_WORKER_VISION_MODEL || "google/gemma-4-e4b";
 const ensureProxyScript = path.join(projectRoot, "ensure-lmstudio-switch-proxy.ps1");
 const xliffReferenceScript = process.env.XLIFF_TRANSLATOR_REFERENCE_SCRIPT
   || "C:\\codex\\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py";
@@ -447,6 +448,85 @@ async function saveInputFiles(task, inputDir) {
   return files;
 }
 
+function isImageFile(file) {
+  const mime = String(file.mime || "").toLowerCase();
+  const name = String(file.relativePath || file.name || "").toLowerCase();
+  return mime.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(name);
+}
+
+function imageMime(file) {
+  const mime = String(file.mime || "").toLowerCase();
+  if (mime.startsWith("image/")) return mime;
+  const name = String(file.relativePath || file.name || "").toLowerCase();
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  if (name.endsWith(".webp")) return "image/webp";
+  if (name.endsWith(".gif")) return "image/gif";
+  if (name.endsWith(".bmp")) return "image/bmp";
+  if (name.endsWith(".tif") || name.endsWith(".tiff")) return "image/tiff";
+  return "image/png";
+}
+
+async function describeImages(task, inputFiles) {
+  const images = inputFiles.filter(isImageFile);
+  if (!images.length) return [];
+  await ensureLmStudioSwitchProxy();
+  const maxImageBytes = Number(process.env.REMOTE_WORKER_INLINE_IMAGE_MAX_BYTES || 20 * 1024 * 1024);
+  const descriptions = [];
+  for (const file of images) {
+    try {
+      const buffer = await fsp.readFile(file.path);
+      if (buffer.length > maxImageBytes) {
+        descriptions.push({
+          file,
+          error: `Image is too large for inline LM Studio vision payload (${buffer.length} bytes).`,
+        });
+        continue;
+      }
+      const response = await fetch(`${lmStudioSwitchBase}/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.LMSTUDIO_API_TOKEN || "lmstudio"}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: lmStudioVisionModel,
+          temperature: 0.1,
+          max_tokens: 1400,
+          messages: [
+            {
+              role: "system",
+              content: "You are a vision-capable assistant. Describe screenshots and images precisely for a downstream local agent. Transcribe visible text, UI labels, objects, layout, errors, and anything relevant to the user's request. Answer in Russian.",
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: `User request: ${task.prompt || "Analyze the image."}\nImage file: ${file.relativePath || file.name}`,
+                },
+                {
+                  type: "image_url",
+                  image_url: { url: `data:${imageMime(file)};base64,${buffer.toString("base64")}` },
+                },
+              ],
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(180000),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error?.message || data.error || `${response.status} ${response.statusText}`);
+      descriptions.push({
+        file,
+        description: String(data.choices?.[0]?.message?.content || "").trim(),
+      });
+    } catch (error) {
+      descriptions.push({ file, error: error.message });
+    }
+  }
+  return descriptions;
+}
+
 function hasTranslationIntent(text) {
   return /\b(translate|translation|translated|locali[sz]e|locali[sz]ation)\b|перевод|перевести|переведи|локализ/i.test(String(text || ""));
 }
@@ -477,7 +557,20 @@ function xliffTranslationPolicyBlock(task, inputFiles) {
   ];
 }
 
-function buildPrompt(task, inputDir, outputDir, inputFiles) {
+function visionAnalysisBlock(visionDescriptions) {
+  if (!visionDescriptions.length) return [];
+  const lines = ["LM Studio vision analysis for attached images:"];
+  for (const item of visionDescriptions) {
+    const label = item.file.relativePath || item.file.name;
+    lines.push(`- ${label}:`);
+    if (item.description) lines.push(item.description);
+    if (item.error) lines.push(`Vision analysis error: ${item.error}`);
+  }
+  lines.push("");
+  return lines;
+}
+
+function buildPrompt(task, inputDir, outputDir, inputFiles, visionDescriptions = []) {
   const fileList = inputFiles.length
     ? inputFiles.map((file) => `- ${file.relativePath || file.name}: ${file.path}`).join("\n")
     : "- no files";
@@ -496,6 +589,7 @@ function buildPrompt(task, inputDir, outputDir, inputFiles) {
     "Answer in Russian unless the task explicitly asks for another language.",
     "",
     ...xliffTranslationPolicyBlock(task, inputFiles),
+    ...visionAnalysisBlock(visionDescriptions),
     "Input files:",
     fileList,
     "",
@@ -668,7 +762,12 @@ async function processTask(task) {
     const inputFiles = await saveInputFiles(task, inputDir);
     await logRemote(task.id, `Saved ${inputFiles.length} input file(s) locally`);
 
-    const prompt = buildPrompt(task, inputDir, outputDir, inputFiles);
+    const imageCount = inputFiles.filter(isImageFile).length;
+    if (imageCount) await logRemote(task.id, `Analyzing ${imageCount} image file(s) with LM Studio vision (${lmStudioVisionModel})`);
+    const visionDescriptions = imageCount ? await describeImages(task, inputFiles) : [];
+    if (imageCount) await logRemote(task.id, `Image vision analysis completed for ${imageCount} file(s)`);
+
+    const prompt = buildPrompt(task, inputDir, outputDir, inputFiles, visionDescriptions);
     const runConfig = await prepareContinueRun(task, taskDir);
     runConfig.promptPath = path.join(taskDir, "continue-prompt.md");
     await fsp.writeFile(runConfig.promptPath, prompt, "utf8");
