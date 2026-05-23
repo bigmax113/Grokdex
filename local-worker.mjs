@@ -289,6 +289,15 @@ function personalContinueConfig(profile) {
 }
 
 function xliffTranslatorEnv() {
+  const embeddingMemoryEnabled =
+    process.env.REMOTE_XLIFF_EMBEDDING_MEMORY_ENABLED
+    || process.env.LM_EMBEDDING_MEMORY_ENABLED
+    || "0";
+  const embeddingCacheEnabled =
+    process.env.REMOTE_XLIFF_EMBEDDING_CACHE_ENABLED
+    || process.env.LM_EMBEDDING_CACHE_ENABLED
+    || "0";
+  const tmxDriveEnabled = process.env.REMOTE_XLIFF_TMX_GOOGLE_DRIVE_ENABLED || "0";
   return {
     LM_CONTEXT_WINDOW: String(xliffTranslationContextWindow),
     LM_BATCH_SOURCE_TOKENS: String(xliffTranslationSourceTokens),
@@ -302,7 +311,12 @@ function xliffTranslatorEnv() {
     XLIFF_TERMINOLOGY_AUDIT_ONLY: process.env.XLIFF_TERMINOLOGY_AUDIT_ONLY || "0",
     XLIFF_POST_BATCH_AUDIT_ENABLED: process.env.XLIFF_POST_BATCH_AUDIT_ENABLED || "1",
     XLIFF_TAG_THINKING_REPAIR_ENABLED: process.env.XLIFF_TAG_THINKING_REPAIR_ENABLED || "1",
-    LM_EMBEDDING_MEMORY_ENABLED: process.env.LM_EMBEDDING_MEMORY_ENABLED || "1",
+    TMX_GOOGLE_DRIVE_ENABLED: tmxDriveEnabled,
+    TMX_FOLDER: process.env.REMOTE_XLIFF_TMX_FOLDER || "",
+    TMX_APPLY_EXACT_MATCHES: process.env.REMOTE_XLIFF_TMX_APPLY_EXACT_MATCHES || "0",
+    LM_EMBEDDING_MEMORY_ENABLED: embeddingMemoryEnabled,
+    LM_EMBEDDING_CACHE_ENABLED: embeddingCacheEnabled,
+    LM_EMBEDDING_MAX_TMX_REFERENCES: process.env.REMOTE_XLIFF_EMBEDDING_MAX_TMX_REFERENCES || "0",
     DOCUMENT_TRANSLATION_CACHE_ENABLED: process.env.DOCUMENT_TRANSLATION_CACHE_ENABLED || "1",
   };
 }
@@ -634,11 +648,11 @@ function xliffTranslationPolicyBlock(task, inputFiles) {
     "The user is asking to translate/localize uploaded documents. Every document translation must go through XLIFF.",
     "Required path: source document/archive -> extracted working files -> XLIFF trans-units -> document-level terminology/memory collection -> locked terminology index -> large batched translation -> post-batch audit/repair -> reconstruct final document from the translated XLIFF.",
     `Reference implementation on this machine: ${xliffReferenceScript}`,
-    "Use the reference implementation behavior, not a simplified translator. It first collects confirmed references, TMX/embedding memory, document terminology candidates, and terminology locks for the whole XLIFF/document set, then translates unconfirmed units in large token-budgeted batches.",
+    "Use the reference implementation behavior, not a simplified translator. It first collects document terminology candidates and terminology locks for the whole XLIFF/document set, then translates unconfirmed units in large token-budgeted batches.",
     `Runtime XLIFF budget for this worker: LM_CONTEXT_WINDOW=${xliffTranslationContextWindow}, LM_BATCH_SOURCE_TOKENS=${xliffTranslationSourceTokens}, LM_MAX_UNITS_PER_BLOCK=${xliffTranslationMaxUnits}, LM_FULL_CONTEXT_MIN_OUTPUT_TOKENS=${xliffTranslationMinOutputTokens}, LM_FULL_CONTEXT_TARGET_OUTPUT_TOKENS=${xliffTranslationOutputTokens}.`,
     "This applies to every document format: DOCX paragraphs, PDF lines, XLSX cells/rows/sheets, PPTX text boxes/shapes/slides, HTML/XML nodes, and archives of mixed documents must all be converted to XLIFF first and translated as batched trans-units.",
     "Do not translate line-by-line, row-by-row, cell-by-cell, paragraph-by-paragraph, textbox-by-textbox, slide-by-slide, page-by-page, or one trans-unit per model call unless the reference implementation's fallback split is triggered by marker failure or post-batch audit failure.",
-    "Do not skip terminology unification. Keep XLIFF_TERMINOLOGY_LOCK_ENABLED=1, XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS=1, LM_EMBEDDING_MEMORY_ENABLED=1, DOCUMENT_TRANSLATION_CACHE_ENABLED=1, and XLIFF_POST_BATCH_AUDIT_ENABLED=1 unless the user explicitly disables them.",
+    "Do not skip terminology unification. Keep XLIFF_TERMINOLOGY_LOCK_ENABLED=1, XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS=1, DOCUMENT_TRANSLATION_CACHE_ENABLED=1, and XLIFF_POST_BATCH_AUDIT_ENABLED=1. Do not use TMX or embedding memory for this remote test mode unless the user explicitly enables them.",
     "For DOCX use the reference-style flow: docx_to_xliff -> translate_xliff_file -> xliff_to_docx.",
     "For PDF use the reference-style flow: pdf_to_xliff -> translate_xliff_file -> xliff_to_pdf_page_aware.",
     "For a mixed folder/archive, unpack it first, process every supported document through the XLIFF flow, preserve relative paths, and put all final documents plus useful XLIFF/audit artifacts into the output directory.",
@@ -930,6 +944,12 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
     LM_STUDIO_FULL_RESTART: process.env.LM_STUDIO_FULL_RESTART || "0",
     LM_STUDIO_STOP_AFTER_SESSION: process.env.LM_STUDIO_STOP_AFTER_SESSION || "0",
     LM_MODEL_CLEAN_START_DELAY_SECONDS: process.env.LM_MODEL_CLEAN_START_DELAY_SECONDS || "0",
+    TMX_GOOGLE_DRIVE_ENABLED: process.env.REMOTE_XLIFF_TMX_GOOGLE_DRIVE_ENABLED || "0",
+    TMX_FOLDER: process.env.REMOTE_XLIFF_TMX_FOLDER || "",
+    TMX_APPLY_EXACT_MATCHES: process.env.REMOTE_XLIFF_TMX_APPLY_EXACT_MATCHES || "0",
+    LM_EMBEDDING_MEMORY_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_MEMORY_ENABLED || "0",
+    LM_EMBEDDING_CACHE_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_CACHE_ENABLED || "0",
+    LM_EMBEDDING_MAX_TMX_REFERENCES: process.env.REMOTE_XLIFF_EMBEDDING_MAX_TMX_REFERENCES || "0",
     PYTHONUTF8: "1",
     PYTHONIOENCODING: "utf-8",
     NO_COLOR: "1",
@@ -947,7 +967,7 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
 
   await logRemote(
     taskId,
-    `Direct XLIFF runner started (${sourceLang}->${targetLangs.join(", ")}; files=${supported.length}; context=${xliffTranslationContextWindow}; batch_source=${xliffTranslationSourceTokens}; target_output=${xliffTranslationOutputTokens})`,
+    `Direct XLIFF runner started (${sourceLang}->${targetLangs.join(", ")}; files=${supported.length}; context=${xliffTranslationContextWindow}; batch_source=${xliffTranslationSourceTokens}; target_output=${xliffTranslationOutputTokens}; tmx=${env.TMX_GOOGLE_DRIVE_ENABLED === "1" ? "on" : "off"}; embedding=${env.LM_EMBEDDING_MEMORY_ENABLED === "1" ? "on" : "off"})`,
   );
 
   return await new Promise((resolve, reject) => {
