@@ -6,10 +6,29 @@ function setLoginStatus(text) {
   $("loginStatus").textContent = text || "";
 }
 
+function setRemoteStatus(text) {
+  $("remoteStatus").textContent = text || "";
+}
+
 function append(text) {
   const output = $("output");
   output.textContent += text;
   output.scrollTop = output.scrollHeight;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function api(path, options = {}) {
@@ -27,12 +46,16 @@ async function refreshMe() {
   $("email").value = me.otpEmail || "";
   $("login").classList.toggle("hidden", me.authenticated);
   $("app").classList.toggle("hidden", !me.authenticated);
-  if (me.authenticated) await refreshStatus();
+  if (me.authenticated) {
+    await refreshStatus();
+    await refreshDriveProfile().catch((error) => setRemoteStatus(error.message));
+    await refreshRemoteTasks().catch((error) => setRemoteStatus(error.message));
+  }
 }
 
 async function refreshStatus() {
   const status = await api("/api/status");
-  $("runtime").textContent = `${status.email} · ${status.workspace} · XAI ${status.xaiKey ? "ready" : "missing"} · SMTP ${status.smtp ? "ready" : "missing"}`;
+  $("runtime").textContent = `${status.email} - ${status.workspace} - XAI ${status.xaiKey ? "ready" : "missing"} - SMTP ${status.smtp ? "ready" : "missing"}`;
 }
 
 async function sendCode() {
@@ -66,6 +89,7 @@ async function verifyCode() {
 async function logout() {
   await api("/api/auth/logout", { method: "POST", body: "{}" });
   $("output").textContent = "";
+  $("remoteTasks").innerHTML = "";
   await refreshMe();
 }
 
@@ -108,7 +132,7 @@ async function runAgent(event) {
       body: JSON.stringify({
         runId: currentRunId,
         prompt,
-        model: $("model").value,
+        model: "grok-build",
         auto: $("auto").checked,
       }),
     });
@@ -138,13 +162,130 @@ async function stopRun() {
   }).catch(() => {});
 }
 
+async function refreshDriveProfile() {
+  const data = await api("/api/drive/profile");
+  const active = data.active || {};
+  const button = $("connectDrive");
+  if (active.mode === "personal") {
+    $("driveProfile").textContent = `Using your Drive: ${active.folderName || active.folderId}`;
+    button.textContent = "Connected";
+    button.disabled = true;
+    return;
+  }
+  if (active.mode === "personal_required") {
+    $("driveProfile").textContent = "Your Drive is required";
+    button.textContent = "Connect Drive";
+    button.disabled = !data.connectEnabled;
+    return;
+  }
+  $("driveProfile").textContent = "Using default test Drive";
+  button.textContent = "Use my Drive";
+  button.disabled = !data.connectEnabled;
+}
+
+async function connectDrive() {
+  setRemoteStatus("Preparing Google Drive authorization...");
+  try {
+    const data = await api("/api/drive/connect/start", { method: "POST", body: "{}" });
+    window.open(data.authUrl, "_blank", "noopener,noreferrer");
+    setRemoteStatus("Google authorization opened. Refresh after approval.");
+  } catch (error) {
+    setRemoteStatus(error.message);
+  }
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      resolve(value.includes(",") ? value.slice(value.indexOf(",") + 1) : value);
+    };
+    reader.onerror = () => reject(reader.error || new Error("File read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function createRemoteTask(event) {
+  event.preventDefault();
+  const prompt = $("remotePrompt").value.trim();
+  const selected = Array.from($("remoteFiles").files || []);
+  if (!prompt && !selected.length) return;
+
+  $("createRemoteTask").disabled = true;
+  setRemoteStatus("Uploading job...");
+  try {
+    const files = [];
+    for (const file of selected) {
+      files.push({
+        name: file.name,
+        mime: file.type || "application/octet-stream",
+        base64: await fileToBase64(file),
+      });
+    }
+    await api("/api/remote/tasks", {
+      method: "POST",
+      body: JSON.stringify({ prompt, files }),
+    });
+    $("remotePrompt").value = "";
+    $("remoteFiles").value = "";
+    setRemoteStatus("Job created.");
+    await refreshRemoteTasks();
+  } catch (error) {
+    setRemoteStatus(error.message);
+  } finally {
+    $("createRemoteTask").disabled = false;
+  }
+}
+
+function renderTask(task) {
+  const statusClass = `status-${escapeHtml(task.status)}`;
+  const created = task.createdAt ? new Date(task.createdAt).toLocaleString() : "";
+  const inputs = (task.files || []).map((file) => `<span>${escapeHtml(file.name)} (${formatBytes(file.size)})</span>`).join("");
+  const results = (task.resultFiles || [])
+    .map((file) => `<a href="${file.downloadUrl}">${escapeHtml(file.name)} (${formatBytes(file.size)})</a>`)
+    .join("");
+  const logs = (task.logs || []).slice(-4).map((log) => `<div>${escapeHtml(log.message)}</div>`).join("");
+  return `
+    <article class="taskItem">
+      <div class="taskTop">
+        <strong>${escapeHtml(task.id)}</strong>
+        <span class="pill ${statusClass}">${escapeHtml(task.status)}</span>
+      </div>
+      <p>${escapeHtml(task.prompt || "No prompt")}</p>
+      <div class="muted">${escapeHtml(created)}${task.workerId ? ` - ${escapeHtml(task.workerId)}` : ""}</div>
+      ${inputs ? `<div class="chips">${inputs}</div>` : ""}
+      ${task.error ? `<div class="taskError">${escapeHtml(task.error)}</div>` : ""}
+      ${results ? `<div class="results">${results}</div>` : ""}
+      ${logs ? `<details><summary>Logs</summary>${logs}</details>` : ""}
+    </article>
+  `;
+}
+
+async function refreshRemoteTasks() {
+  setRemoteStatus("Refreshing...");
+  const data = await api("/api/remote/tasks");
+  const tasks = data.tasks || [];
+  $("remoteTasks").innerHTML = tasks.length
+    ? tasks.map(renderTask).join("")
+    : '<div class="empty">No document jobs yet.</div>';
+  setRemoteStatus(`${tasks.length} job(s).`);
+}
+
 $("sendCode").addEventListener("click", sendCode);
 $("verifyCode").addEventListener("click", verifyCode);
 $("logout").addEventListener("click", logout);
 $("promptForm").addEventListener("submit", runAgent);
 $("stop").addEventListener("click", stopRun);
+$("remoteTaskForm").addEventListener("submit", createRemoteTask);
+$("refreshRemoteTasks").addEventListener("click", () => refreshRemoteTasks().catch((error) => setRemoteStatus(error.message)));
+$("connectDrive").addEventListener("click", connectDrive);
 $("code").addEventListener("keydown", (event) => {
   if (event.key === "Enter") verifyCode();
 });
+
+setInterval(() => {
+  if (!$("app").classList.contains("hidden")) refreshRemoteTasks().catch(() => {});
+}, 15000);
 
 refreshMe().catch((error) => setLoginStatus(error.message));

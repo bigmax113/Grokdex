@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs"
+    "worker": "node local-worker.mjs",
+    "check": "node --check server.mjs && node --check local-worker.mjs"
   },
   "dependencies": {
     "@continuedev/cli": "^1.5.45",
+    "googleapis": "^144.0.0",
     "nodemailer": "^7.0.10"
   },
   "engines": {

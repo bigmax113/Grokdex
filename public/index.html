@@ -11,7 +11,7 @@
       <section id="login" class="card">
         <div class="mark">CR</div>
         <h1>Continue Render Agent</h1>
-        <p class="muted">Доступ подтверждается 4-значным кодом, который отправляется владельцу.</p>
+        <p class="muted">Access is protected by a 4-digit code sent to the owner mailbox.</p>
         <label>
           Email
           <input id="email" type="email" autocomplete="email" />
@@ -32,23 +32,49 @@
             <div id="runtime" class="muted"></div>
           </div>
           <div class="actions">
-            <select id="model">
-              <option value="grok-build">Grok Build 0.1 coding</option>
-              <option value="grok-4.3">Grok 4.3 long context</option>
-            </select>
             <label class="check"><input id="auto" type="checkbox" /> Auto edits</label>
             <button id="logout" type="button">Logout</button>
           </div>
         </header>
-        <section class="chat">
-          <pre id="output"></pre>
-          <form id="promptForm" class="composer">
-            <textarea id="prompt" rows="5" placeholder="Например: проанализируй репозиторий, найди архитектурные риски и предложи план исправлений."></textarea>
-            <div class="composerActions">
-              <button id="stop" type="button" disabled>Stop</button>
-              <button id="send" type="submit">Run</button>
+
+        <section class="workbench">
+          <section class="chat">
+            <pre id="output"></pre>
+            <form id="promptForm" class="composer">
+              <textarea id="prompt" rows="5" placeholder="Ask the remote Render agent..."></textarea>
+              <div class="composerActions">
+                <button id="stop" type="button" disabled>Stop</button>
+                <button id="send" type="submit">Run</button>
+              </div>
+            </form>
+          </section>
+
+          <aside class="remotePanel">
+            <div class="panelHeader">
+              <h2>Document jobs</h2>
+              <button id="refreshRemoteTasks" type="button">Refresh</button>
             </div>
-          </form>
+            <div class="storageBox">
+              <div>
+                <div id="driveProfile" class="storageTitle">Storage</div>
+                <div class="muted">Switching to your Drive is permanent for future jobs.</div>
+              </div>
+              <button id="connectDrive" type="button">Use my Drive</button>
+            </div>
+            <form id="remoteTaskForm" class="remoteForm">
+              <label>
+                Task
+                <textarea id="remotePrompt" rows="4" placeholder="Translate, analyze, extract, convert..."></textarea>
+              </label>
+              <label>
+                Files
+                <input id="remoteFiles" type="file" multiple />
+              </label>
+              <button id="createRemoteTask" type="submit">Create job</button>
+            </form>
+            <div id="remoteStatus" class="status"></div>
+            <div id="remoteTasks" class="taskList"></div>
+          </aside>
         </section>
       </section>
     </main>

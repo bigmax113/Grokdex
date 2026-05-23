@@ -5,6 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { Readable } from "node:stream";
 import nodemailer from "nodemailer";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -15,12 +16,48 @@ const port = Number(process.env.PORT || 3000);
 const otpEmail = process.env.OTP_EMAIL || "bigmax113@gmail.com";
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(48).toString("hex");
 const workspace = path.resolve(process.env.RENDER_WORKSPACE || path.join(__dirname, ".render-workspace"));
+const chatStoreFile = path.join(__dirname, "sessions", "chats.json");
+const chatStoreRepo = process.env.CHAT_STORE_REPO || "bigmax113/Grodex";
+const chatStoreBranch = process.env.CHAT_STORE_BRANCH || "main";
+const chatStorePath = process.env.CHAT_STORE_PATH || "data/chats.json";
+const driveProfilesFile = path.join(__dirname, "sessions", "drive-profiles.json");
+const llmProfilesFile = path.join(__dirname, "sessions", "llm-profiles.json");
+const remoteJobsDir = path.join(__dirname, "remote-jobs");
+const defaultGoogleDriveFolderId = "1WGbLfKoL8bYEi6fIXI2ktBPZmwAe86Pj";
+const remoteWorkerToken = process.env.REMOTE_WORKER_TOKEN || "";
+const remoteFileLimitBytes = Number(process.env.REMOTE_FILE_LIMIT_BYTES || 25 * 1024 * 1024);
+const remoteTotalLimitBytes = Number(process.env.REMOTE_TOTAL_LIMIT_BYTES || 80 * 1024 * 1024);
+const googleDriveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID || defaultGoogleDriveFolderId;
+const googleDriveAuthMode = String(process.env.GOOGLE_DRIVE_AUTH_MODE || "").trim().toLowerCase();
+const googleServiceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+const googleServiceAccountJsonB64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+const googleDriveOAuthClientJson = process.env.GOOGLE_DRIVE_OAUTH_CLIENT_JSON || "";
+const googleDriveOAuthClientJsonB64 = process.env.GOOGLE_DRIVE_OAUTH_CLIENT_JSON_B64 || "";
+const googleDriveOAuthClientFile = process.env.GOOGLE_DRIVE_OAUTH_CLIENT_FILE || "";
+const googleDriveOAuthTokenJson = process.env.GOOGLE_DRIVE_OAUTH_TOKEN_JSON || "";
+const googleDriveOAuthTokenJsonB64 = process.env.GOOGLE_DRIVE_OAUTH_TOKEN_JSON_B64 || "";
+const googleDriveOAuthTokenFile = process.env.GOOGLE_DRIVE_OAUTH_TOKEN_FILE || "";
+const googleDriveConnectEnabled = String(process.env.GOOGLE_DRIVE_CONNECT_ENABLED || "true").toLowerCase() === "true";
+const googleDriveUsePersonalProfiles = String(process.env.GOOGLE_DRIVE_USE_PERSONAL_PROFILES || "true").toLowerCase() !== "false";
+const ownerResourceFallbackEnabled = String(process.env.OWNER_RESOURCE_FALLBACK_ENABLED || "true").toLowerCase() !== "false";
+const googleDriveOAuthRedirectUri = process.env.GOOGLE_DRIVE_OAUTH_REDIRECT_URI || "";
+const googleDriveProfileFolderName = process.env.GOOGLE_DRIVE_PROFILE_FOLDER_NAME || "Continue Render Agent";
+const googleDriveProfileStateTtlMs = Number(process.env.GOOGLE_DRIVE_PROFILE_STATE_TTL_MS || 15 * 60 * 1000);
 const codeTtlMs = Number(process.env.OTP_TTL_MS || 10 * 60 * 1000);
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 const activeRuns = new Map();
 const pendingCodes = new Map();
 const sessions = new Map();
 const requestBuckets = new Map();
+let continueStatus = { ok: false, checkedAt: null, error: "not checked" };
+let chatStoreCache = null;
+let chatStoreSha = null;
+let driveProfilesCache = null;
+let llmProfilesCache = null;
+let driveClient = null;
+const driveClients = new Map();
+const driveFolderCache = new Map();
+const driveConnectStates = new Map();
 
 function json(res, status, payload, headers = {}) {
   const body = JSON.stringify(payload);
@@ -224,6 +261,1242 @@ function cnExecutable() {
   return path.join(__dirname, "node_modules", ".bin", bin);
 }
 
+function chatStoreUsesGithub() {
+  return Boolean(process.env.CHAT_STORE_GITHUB_TOKEN && chatStoreRepo);
+}
+
+function normalizeChatStore(value) {
+  const sessionsList = Array.isArray(value?.sessions) ? value.sessions : [];
+  return {
+    version: 1,
+    sessions: sessionsList.map((session) => ({
+      id: String(session.id),
+      title: String(session.title || "New chat"),
+      createdAt: session.createdAt || new Date().toISOString(),
+      updatedAt: session.updatedAt || session.createdAt || new Date().toISOString(),
+      messages: Array.isArray(session.messages) ? session.messages : [],
+    })),
+  };
+}
+
+function titleFromText(text) {
+  const value = String(text || "New chat").replace(/\s+/g, " ").trim();
+  return value.length > 64 ? `${value.slice(0, 64)}...` : value || "New chat";
+}
+
+async function loadChatStore({ force = false } = {}) {
+  if (chatStoreCache && !force) return chatStoreCache;
+
+  if (chatStoreUsesGithub()) {
+    const url = `https://api.github.com/repos/${chatStoreRepo}/contents/${encodeURIComponent(chatStorePath).replace(/%2F/g, "/")}?ref=${encodeURIComponent(chatStoreBranch)}`;
+    const response = await fetch(url, {
+      headers: {
+        authorization: `Bearer ${process.env.CHAT_STORE_GITHUB_TOKEN}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+      },
+    });
+    if (response.ok) {
+      const data = await response.json();
+      chatStoreSha = data.sha;
+      const jsonText = Buffer.from(String(data.content || ""), "base64").toString("utf8");
+      chatStoreCache = normalizeChatStore(JSON.parse(jsonText));
+      return chatStoreCache;
+    }
+    if (response.status !== 404) {
+      throw new Error(`GitHub chat store load failed: HTTP ${response.status}`);
+    }
+  }
+
+  try {
+    chatStoreCache = normalizeChatStore(JSON.parse(await fsp.readFile(chatStoreFile, "utf8")));
+  } catch {
+    chatStoreCache = normalizeChatStore({ sessions: [] });
+  }
+  return chatStoreCache;
+}
+
+async function saveChatStore(store) {
+  chatStoreCache = normalizeChatStore(store);
+  await fsp.mkdir(path.dirname(chatStoreFile), { recursive: true });
+  await fsp.writeFile(chatStoreFile, `${JSON.stringify(chatStoreCache, null, 2)}\n`, "utf8");
+
+  if (!chatStoreUsesGithub()) return;
+  const url = `https://api.github.com/repos/${chatStoreRepo}/contents/${encodeURIComponent(chatStorePath).replace(/%2F/g, "/")}`;
+  const payload = {
+    message: "chore: sync remote agent chats",
+    branch: chatStoreBranch,
+    content: Buffer.from(`${JSON.stringify(chatStoreCache, null, 2)}\n`, "utf8").toString("base64"),
+  };
+  if (chatStoreSha) payload.sha = chatStoreSha;
+
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${process.env.CHAT_STORE_GITHUB_TOKEN}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "x-github-api-version": "2022-11-28",
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.message || `GitHub chat store save failed: HTTP ${response.status}`);
+  }
+  chatStoreSha = data.content?.sha || chatStoreSha;
+}
+
+async function listChats() {
+  const store = await loadChatStore({ force: chatStoreUsesGithub() });
+  return [...store.sessions]
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+    .map((session) => ({
+      id: session.id,
+      title: session.title,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      messageCount: session.messages.length,
+    }));
+}
+
+async function getChat(id) {
+  const store = await loadChatStore();
+  return store.sessions.find((session) => session.id === id) || null;
+}
+
+async function ensureChat(id, firstPrompt = "") {
+  const store = await loadChatStore();
+  const existing = id ? store.sessions.find((session) => session.id === id) : null;
+  if (existing) return existing;
+
+  const now = new Date().toISOString();
+  const session = {
+    id: id || `chat-${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`,
+    title: titleFromText(firstPrompt),
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  };
+  store.sessions.push(session);
+  await saveChatStore(store);
+  return session;
+}
+
+async function appendChatMessage(chatId, message) {
+  const store = await loadChatStore();
+  const session = store.sessions.find((item) => item.id === chatId);
+  if (!session) return;
+  session.messages.push({
+    role: message.role,
+    content: String(message.content || ""),
+    createdAt: new Date().toISOString(),
+  });
+  if (!session.title || session.title === "New chat") {
+    const firstUser = session.messages.find((item) => item.role === "user");
+    session.title = titleFromText(firstUser?.content);
+  }
+  session.updatedAt = new Date().toISOString();
+  await saveChatStore(store);
+}
+
+async function deleteChat(id) {
+  const store = await loadChatStore();
+  store.sessions = store.sessions.filter((session) => session.id !== id);
+  await saveChatStore(store);
+}
+
+function safeRemoteId(value) {
+  const id = String(value || "");
+  if (!/^[a-zA-Z0-9_-]{12,80}$/.test(id)) {
+    throw new Error("Invalid task id");
+  }
+  return id;
+}
+
+function remoteTaskId() {
+  return `task-${Date.now().toString(36)}-${crypto.randomBytes(5).toString("hex")}`;
+}
+
+function safeFileName(name) {
+  return String(name || "file")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160) || "file";
+}
+
+function normalizedEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function encryptionKey() {
+  return crypto.createHash("sha256").update(sessionSecret).digest();
+}
+
+function encryptSecret(value) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString("base64url")}.${tag.toString("base64url")}.${encrypted.toString("base64url")}`;
+}
+
+function decryptSecret(value) {
+  const [ivRaw, tagRaw, encryptedRaw] = String(value || "").split(".");
+  if (!ivRaw || !tagRaw || !encryptedRaw) throw new Error("Invalid encrypted secret");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivRaw, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagRaw, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encryptedRaw, "base64url")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+async function loadDriveProfiles() {
+  if (driveProfilesCache) return driveProfilesCache;
+  try {
+    const raw = JSON.parse(await fsp.readFile(driveProfilesFile, "utf8"));
+    driveProfilesCache = {
+      version: 1,
+      profiles: Array.isArray(raw.profiles) ? raw.profiles : [],
+    };
+  } catch {
+    driveProfilesCache = { version: 1, profiles: [] };
+  }
+  return driveProfilesCache;
+}
+
+async function saveDriveProfiles(store) {
+  driveProfilesCache = {
+    version: 1,
+    profiles: Array.isArray(store.profiles) ? store.profiles : [],
+  };
+  await fsp.mkdir(path.dirname(driveProfilesFile), { recursive: true });
+  await fsp.writeFile(driveProfilesFile, `${JSON.stringify(driveProfilesCache, null, 2)}\n`, "utf8");
+}
+
+async function getDriveProfile(email) {
+  const target = normalizedEmail(email);
+  if (!target) return null;
+  const store = await loadDriveProfiles();
+  return store.profiles.find((profile) => normalizedEmail(profile.email) === target) || null;
+}
+
+async function upsertDriveProfile(profile) {
+  const store = await loadDriveProfiles();
+  const target = normalizedEmail(profile.email);
+  const existing = store.profiles.find((item) => normalizedEmail(item.email) === target) || {};
+  store.profiles = store.profiles.filter((item) => normalizedEmail(item.email) !== target);
+  store.profiles.push({ ...existing, ...profile, email: target, updatedAt: new Date().toISOString() });
+  await saveDriveProfiles(store);
+}
+
+async function activeBlobDriveProfile(email) {
+  if (!googleDriveUsePersonalProfiles) return null;
+  const profile = await getDriveProfile(email);
+  if (!profile?.folderId || !profile?.tokenCipher) return null;
+  return profile;
+}
+
+function publicDriveProfile(profile) {
+  if (!profile) {
+    if (!ownerResourceFallbackEnabled) {
+      return {
+        mode: "personal_required",
+        connected: false,
+        defaultAvailable: false,
+      };
+    }
+    return {
+      mode: "default",
+      connected: false,
+      defaultAvailable: true,
+      folderId: googleDriveFolderId,
+      folderName: "Default test Drive",
+    };
+  }
+  const connected = Boolean(profile.folderId && profile.tokenCipher);
+  if (!connected && (profile.defaultDriveDisabledAt || !ownerResourceFallbackEnabled)) {
+    return {
+      mode: "personal_required",
+      connected: false,
+      defaultAvailable: false,
+      defaultDisabledAt: profile.defaultDriveDisabledAt,
+    };
+  }
+  return {
+    mode: connected ? "personal" : "default",
+    connected,
+    defaultAvailable: ownerResourceFallbackEnabled && !profile.defaultDriveDisabledAt,
+    email: profile.email,
+    folderId: connected ? profile.folderId : googleDriveFolderId,
+    folderName: profile.folderName || googleDriveProfileFolderName,
+    defaultDisabledAt: profile.defaultDriveDisabledAt || null,
+    connectedAt: profile.connectedAt || null,
+    updatedAt: profile.updatedAt || null,
+  };
+}
+
+async function loadLlmProfiles() {
+  if (llmProfilesCache) return llmProfilesCache;
+  try {
+    const raw = JSON.parse(await fsp.readFile(llmProfilesFile, "utf8"));
+    llmProfilesCache = {
+      version: 1,
+      profiles: Array.isArray(raw.profiles) ? raw.profiles : [],
+    };
+  } catch {
+    llmProfilesCache = { version: 1, profiles: [] };
+  }
+  return llmProfilesCache;
+}
+
+async function saveLlmProfiles(store) {
+  llmProfilesCache = {
+    version: 1,
+    profiles: Array.isArray(store.profiles) ? store.profiles : [],
+  };
+  await fsp.mkdir(path.dirname(llmProfilesFile), { recursive: true });
+  await fsp.writeFile(llmProfilesFile, `${JSON.stringify(llmProfilesCache, null, 2)}\n`, "utf8");
+}
+
+async function getLlmProfile(email) {
+  const target = normalizedEmail(email);
+  if (!target) return null;
+  const store = await loadLlmProfiles();
+  return store.profiles.find((profile) => normalizedEmail(profile.email) === target) || null;
+}
+
+function normalizeLlmProfileInput(email, body) {
+  const provider = String(body.provider || "openai").trim().toLowerCase();
+  const model = String(body.model || "").trim();
+  const apiBase = String(body.apiBase || "").trim();
+  const apiKey = String(body.apiKey || "").trim();
+  const name = String(body.name || model || "Personal LLM").trim().slice(0, 80);
+  if (!model) throw new Error("model is required");
+  if (!apiBase) throw new Error("apiBase is required");
+  const keylessProvider = ["lmstudio", "ollama"].includes(provider) || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(apiBase);
+  if (!keylessProvider && apiKey.length < 8 && !body.keepExistingKey) throw new Error("apiKey is required");
+  const temperature = Number(body.temperature ?? 0.2);
+  const contextLength = Number(body.contextLength || 131072);
+  const maxTokens = Number(body.maxTokens || 8192);
+  return {
+    email: normalizedEmail(email),
+    enabled: body.enabled !== false,
+    name,
+    provider,
+    model,
+    apiBase,
+    apiKey,
+    keepExistingKey: Boolean(body.keepExistingKey),
+    temperature: Number.isFinite(temperature) ? temperature : 0.2,
+    contextLength: Number.isFinite(contextLength) ? contextLength : 131072,
+    maxTokens: Number.isFinite(maxTokens) ? maxTokens : 8192,
+  };
+}
+
+function publicLlmProfile(profile) {
+  if (!profile) return { mode: "default", connected: false };
+  return {
+    mode: "personal",
+    connected: true,
+    enabled: profile.enabled !== false,
+    name: profile.name,
+    provider: profile.provider,
+    model: profile.model,
+    apiBase: profile.apiBase,
+    contextLength: profile.contextLength,
+    maxTokens: profile.maxTokens,
+    temperature: profile.temperature,
+    updatedAt: profile.updatedAt || null,
+  };
+}
+
+function workerLlmProfile(profile) {
+  if (!profile || profile.enabled === false) return null;
+  return {
+    name: profile.name,
+    provider: profile.provider,
+    model: profile.model,
+    apiBase: profile.apiBase,
+    apiKey: profile.apiKeyCipher ? decryptSecret(profile.apiKeyCipher) : "",
+    contextLength: profile.contextLength,
+    maxTokens: profile.maxTokens,
+    temperature: profile.temperature,
+  };
+}
+
+async function upsertLlmProfile(email, body) {
+  const input = normalizeLlmProfileInput(email, body);
+  const existing = await getLlmProfile(email);
+  const apiKeyCipher = input.keepExistingKey && existing?.apiKeyCipher
+    ? existing.apiKeyCipher
+    : input.apiKey
+      ? encryptSecret(input.apiKey)
+      : "";
+  const profile = {
+    email: input.email,
+    enabled: input.enabled,
+    name: input.name,
+    provider: input.provider,
+    model: input.model,
+    apiBase: input.apiBase,
+    apiKeyCipher,
+    temperature: input.temperature,
+    contextLength: input.contextLength,
+    maxTokens: input.maxTokens,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const store = await loadLlmProfiles();
+  store.profiles = store.profiles.filter((item) => normalizedEmail(item.email) !== input.email);
+  store.profiles.push(profile);
+  await saveLlmProfiles(store);
+  return profile;
+}
+
+async function deleteLlmProfile(email) {
+  const target = normalizedEmail(email);
+  const store = await loadLlmProfiles();
+  const before = store.profiles.length;
+  store.profiles = store.profiles.filter((item) => normalizedEmail(item.email) !== target);
+  await saveLlmProfiles(store);
+  return before !== store.profiles.length;
+}
+
+async function handleLlmProfileGet(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const profile = await getLlmProfile(session.email);
+  json(res, 200, { email: session.email, active: publicLlmProfile(profile) });
+}
+
+async function handleLlmProfilePut(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const body = await readBody(req);
+  const profile = await upsertLlmProfile(session.email, body);
+  json(res, 200, { ok: true, active: publicLlmProfile(profile) });
+}
+
+async function handleLlmProfileDelete(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const deleted = await deleteLlmProfile(session.email);
+  json(res, 200, { ok: true, deleted });
+}
+
+function useDriveStorage() {
+  if (!googleDriveFolderId) return false;
+  if (authModeUsesOAuth()) return hasGoogleOAuthCredentials();
+  return hasGoogleServiceAccountCredentials();
+}
+
+function authModeUsesOAuth() {
+  if (googleDriveAuthMode) return googleDriveAuthMode === "oauth";
+  return hasGoogleOAuthCredentials() && !hasGoogleServiceAccountCredentials();
+}
+
+function hasGoogleServiceAccountCredentials() {
+  return Boolean(googleServiceAccountJson || googleServiceAccountJsonB64);
+}
+
+function hasGoogleOAuthCredentials() {
+  return Boolean(
+    (googleDriveOAuthClientJson || googleDriveOAuthClientJsonB64 || googleDriveOAuthClientFile) &&
+    (googleDriveOAuthTokenJson || googleDriveOAuthTokenJsonB64 || googleDriveOAuthTokenFile)
+  );
+}
+
+function readCredentialFile(filePath) {
+  if (!filePath) return "";
+  const resolved = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
+  if (!fs.existsSync(resolved)) return "";
+  return fs.readFileSync(resolved, "utf8");
+}
+
+function parseJsonCredential({ jsonText = "", jsonB64 = "", filePath = "" }) {
+  const raw = jsonText || (jsonB64 ? Buffer.from(jsonB64, "base64").toString("utf8") : "") || readCredentialFile(filePath);
+  if (!raw) throw new Error("Google Drive credentials are not configured");
+  return JSON.parse(raw);
+}
+
+function parseGoogleCredentials() {
+  const raw = googleServiceAccountJson || Buffer.from(googleServiceAccountJsonB64, "base64").toString("utf8");
+  return JSON.parse(raw);
+}
+
+function parseGoogleOAuthClient() {
+  return parseJsonCredential({
+    jsonText: googleDriveOAuthClientJson,
+    jsonB64: googleDriveOAuthClientJsonB64,
+    filePath: googleDriveOAuthClientFile,
+  });
+}
+
+function parseGoogleOAuthToken() {
+  return parseJsonCredential({
+    jsonText: googleDriveOAuthTokenJson,
+    jsonB64: googleDriveOAuthTokenJsonB64,
+    filePath: googleDriveOAuthTokenFile,
+  });
+}
+
+async function googleDrive(profile = null) {
+  const { google } = await import("googleapis");
+  if (profile?.tokenCipher) {
+    const key = `profile:${normalizedEmail(profile.email)}:${profile.updatedAt || ""}`;
+    if (driveClients.has(key)) return driveClients.get(key);
+    const clientSource = parseGoogleOAuthClient();
+    const client = clientSource.installed || clientSource.web || clientSource;
+    const authClient = new google.auth.OAuth2(
+      client.client_id,
+      client.client_secret,
+      Array.isArray(client.redirect_uris) ? client.redirect_uris[0] : undefined,
+    );
+    authClient.setCredentials(JSON.parse(decryptSecret(profile.tokenCipher)));
+    const drive = google.drive({ version: "v3", auth: authClient });
+    driveClients.set(key, drive);
+    return drive;
+  }
+  if (driveClient) return driveClient;
+  let auth;
+  if (authModeUsesOAuth()) {
+    const clientSource = parseGoogleOAuthClient();
+    const client = clientSource.installed || clientSource.web || clientSource;
+    const authClient = new google.auth.OAuth2(
+      client.client_id,
+      client.client_secret,
+      Array.isArray(client.redirect_uris) ? client.redirect_uris[0] : undefined,
+    );
+    authClient.setCredentials(parseGoogleOAuthToken());
+    auth = authClient;
+  } else {
+    auth = new google.auth.GoogleAuth({
+      credentials: parseGoogleCredentials(),
+      scopes: ["https://www.googleapis.com/auth/drive"],
+    });
+  }
+  driveClient = google.drive({ version: "v3", auth });
+  return driveClient;
+}
+
+function driveLiteral(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+async function driveFindChild(parentId, name, mimeType = "", profile = null) {
+  const drive = await googleDrive(profile);
+  const parts = [
+    `'${driveLiteral(parentId)}' in parents`,
+    `name = '${driveLiteral(name)}'`,
+    "trashed = false",
+  ];
+  if (mimeType) parts.push(`mimeType = '${driveLiteral(mimeType)}'`);
+  const response = await drive.files.list({
+    q: parts.join(" and "),
+    fields: "files(id,name,mimeType,size,modifiedTime)",
+    pageSize: 1,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  });
+  return response.data.files?.[0] || null;
+}
+
+async function driveEnsureFolder(parentId, name, profile = null) {
+  const key = `${profile?.email || "default"}:${parentId}:${name}`;
+  if (driveFolderCache.has(key)) return driveFolderCache.get(key);
+  const existing = await driveFindChild(parentId, name, "application/vnd.google-apps.folder", profile);
+  if (existing?.id) {
+    driveFolderCache.set(key, existing.id);
+    return existing.id;
+  }
+  const drive = await googleDrive(profile);
+  const response = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: [parentId],
+    },
+    fields: "id",
+    supportsAllDrives: true,
+  });
+  driveFolderCache.set(key, response.data.id);
+  return response.data.id;
+}
+
+async function driveUploadBuffer(parentId, name, mime, buffer, profile = null) {
+  const drive = await googleDrive(profile);
+  const response = await drive.files.create({
+    requestBody: { name, parents: [parentId] },
+    media: {
+      mimeType: mime || "application/octet-stream",
+      body: Readable.from(buffer),
+    },
+    fields: "id,size,modifiedTime",
+    supportsAllDrives: true,
+  });
+  return response.data.id;
+}
+
+async function driveUpdateBuffer(fileId, mime, buffer, profile = null) {
+  const drive = await googleDrive(profile);
+  await drive.files.update({
+    fileId,
+    media: {
+      mimeType: mime || "application/octet-stream",
+      body: Readable.from(buffer),
+    },
+    supportsAllDrives: true,
+  });
+}
+
+async function driveDownloadBuffer(fileId, profile = null) {
+  const drive = await googleDrive(profile);
+  const response = await drive.files.get(
+    { fileId, alt: "media", supportsAllDrives: true },
+    { responseType: "arraybuffer" },
+  );
+  return Buffer.from(response.data);
+}
+
+function driveRedirectUri(req) {
+  if (googleDriveOAuthRedirectUri) return googleDriveOAuthRedirectUri;
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  return `${proto}://${req.headers.host}/api/drive/callback`;
+}
+
+function assertDriveConnectReady() {
+  if (!googleDriveConnectEnabled) throw new Error("Personal Google Drive connect is disabled");
+  if (!hasGoogleOAuthClientCredentials()) throw new Error("Google Drive OAuth client is not configured");
+}
+
+function hasGoogleOAuthClientCredentials() {
+  return Boolean(googleDriveOAuthClientJson || googleDriveOAuthClientJsonB64 || googleDriveOAuthClientFile);
+}
+
+async function handleDriveProfile(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const profile = await getDriveProfile(session.email);
+  json(res, 200, {
+    email: session.email,
+    connectEnabled: googleDriveConnectEnabled && hasGoogleOAuthClientCredentials(),
+    usePersonalProfiles: googleDriveUsePersonalProfiles,
+    ownerResourceFallbackEnabled,
+    defaultFolderId: googleDriveFolderId,
+    active: publicDriveProfile(profile),
+  });
+}
+
+async function handleDriveConnectStart(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  assertDriveConnectReady();
+  const { google } = await import("googleapis");
+  const clientSource = parseGoogleOAuthClient();
+  const client = clientSource.installed || clientSource.web || clientSource;
+  const redirectUri = driveRedirectUri(req);
+  const authClient = new google.auth.OAuth2(client.client_id, client.client_secret, redirectUri);
+  const state = crypto.randomBytes(24).toString("base64url");
+  driveConnectStates.set(state, {
+    email: normalizedEmail(session.email),
+    redirectUri,
+    expiresAt: Date.now() + googleDriveProfileStateTtlMs,
+  });
+  const authUrl = authClient.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/drive"],
+    state,
+  });
+  json(res, 200, { authUrl, redirectUri });
+}
+
+async function handleDriveCallback(req, res, url) {
+  const state = String(url.searchParams.get("state") || "");
+  const code = String(url.searchParams.get("code") || "");
+  const error = String(url.searchParams.get("error") || "");
+  if (error) {
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end(`Google OAuth error: ${error}`);
+    return;
+  }
+  const pending = driveConnectStates.get(state);
+  if (!pending || pending.expiresAt < Date.now()) {
+    driveConnectStates.delete(state);
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Google OAuth state expired. Start Drive connection again.");
+    return;
+  }
+  if (!code) {
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Missing Google OAuth code.");
+    return;
+  }
+
+  const { google } = await import("googleapis");
+  const clientSource = parseGoogleOAuthClient();
+  const client = clientSource.installed || clientSource.web || clientSource;
+  const authClient = new google.auth.OAuth2(client.client_id, client.client_secret, pending.redirectUri);
+  const tokenResponse = await authClient.getToken(code);
+  const tokens = tokenResponse.tokens || {};
+  authClient.setCredentials(tokens);
+  const drive = google.drive({ version: "v3", auth: authClient });
+  const folder = await drive.files.create({
+    requestBody: {
+      name: googleDriveProfileFolderName,
+      mimeType: "application/vnd.google-apps.folder",
+    },
+    fields: "id,name,webViewLink",
+    supportsAllDrives: true,
+  });
+
+  await upsertDriveProfile({
+    email: pending.email,
+    authMode: "oauth",
+    folderId: folder.data.id,
+    folderName: folder.data.name || googleDriveProfileFolderName,
+    folderUrl: folder.data.webViewLink || null,
+    tokenCipher: encryptSecret(JSON.stringify(tokens)),
+    defaultDriveDisabledAt: new Date().toISOString(),
+    connectedAt: new Date().toISOString(),
+  });
+  driveConnectStates.delete(state);
+
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(`<!doctype html><meta charset="utf-8"><title>Drive connected</title><body style="font-family:Segoe UI,Arial,sans-serif;padding:24px"><h1>Google Drive connected</h1><p>Storage for ${pending.email} is ready. You can close this tab and refresh the Render UI.</p></body>`);
+}
+
+function remoteTaskDir(id) {
+  return path.join(remoteJobsDir, safeRemoteId(id));
+}
+
+function remoteTaskFile(id) {
+  return path.join(remoteTaskDir(id), "task.json");
+}
+
+function connectedDriveProfiles() {
+  const store = driveProfilesCache || { profiles: [] };
+  return store.profiles.filter((profile) => profile?.folderId && profile?.tokenCipher);
+}
+
+async function ownerStorage(email) {
+  const profile = await getDriveProfile(email);
+  if (profile?.folderId && profile?.tokenCipher) {
+    return {
+      kind: "drive",
+      mode: "personal",
+      rootId: profile.folderId,
+      profile,
+      ownerEmail: normalizedEmail(email),
+      folderName: profile.folderName || googleDriveProfileFolderName,
+    };
+  }
+  if (profile?.defaultDriveDisabledAt) {
+    throw new Error("Personal Google Drive must be connected before creating new jobs");
+  }
+  if (!ownerResourceFallbackEnabled) {
+    throw new Error("Personal Google Drive must be connected in release mode");
+  }
+  if (useDriveStorage()) {
+    return {
+      kind: "drive",
+      mode: "default",
+      rootId: googleDriveFolderId,
+      profile: null,
+      ownerEmail: normalizedEmail(email),
+      folderName: "Default test Drive",
+    };
+  }
+  return {
+    kind: "fs",
+    mode: "local",
+    rootId: "",
+    profile: null,
+    ownerEmail: normalizedEmail(email),
+    folderName: "Local Render filesystem",
+  };
+}
+
+async function taskStorage(task) {
+  const ownerEmail = task.storage?.ownerEmail || task.ownerEmail || "";
+  if (task.storage?.mode === "personal") {
+    const profile = await getDriveProfile(ownerEmail);
+    if (!profile?.folderId || !profile?.tokenCipher) throw new Error(`Drive profile not found for ${ownerEmail}`);
+    return {
+      kind: "drive",
+      mode: "personal",
+      rootId: profile.folderId,
+      profile,
+      ownerEmail: normalizedEmail(ownerEmail),
+    };
+  }
+  if (useDriveStorage()) {
+    return {
+      kind: "drive",
+      mode: "default",
+      rootId: googleDriveFolderId,
+      profile: null,
+      ownerEmail: normalizedEmail(ownerEmail),
+    };
+  }
+  return {
+    kind: "fs",
+    mode: "local",
+    rootId: "",
+    profile: null,
+    ownerEmail: normalizedEmail(ownerEmail),
+  };
+}
+
+async function storageCandidates({ email = "", includeAll = false } = {}) {
+  await loadDriveProfiles();
+  if (includeAll) {
+    const candidates = [];
+    if (useDriveStorage()) {
+      candidates.push({ kind: "drive", mode: "default", rootId: googleDriveFolderId, profile: null, ownerEmail: "" });
+    } else {
+      candidates.push({ kind: "fs", mode: "local", rootId: "", profile: null, ownerEmail: "" });
+    }
+    for (const profile of connectedDriveProfiles()) {
+      candidates.push({
+        kind: "drive",
+        mode: "personal",
+        rootId: profile.folderId,
+        profile,
+        ownerEmail: normalizedEmail(profile.email),
+      });
+    }
+    return candidates;
+  }
+
+  const target = normalizedEmail(email);
+  const profile = await getDriveProfile(target);
+  if (profile?.folderId && profile?.tokenCipher) {
+    return [{ kind: "drive", mode: "personal", rootId: profile.folderId, profile, ownerEmail: target }];
+  }
+  if (!ownerResourceFallbackEnabled) return [];
+  if (profile?.defaultDriveDisabledAt) return [];
+  if (useDriveStorage()) return [{ kind: "drive", mode: "default", rootId: googleDriveFolderId, profile: null, ownerEmail: target }];
+  return [{ kind: "fs", mode: "local", rootId: "", profile: null, ownerEmail: target }];
+}
+
+async function readRemoteTaskFromStorage(id, storage) {
+  if (storage.kind === "drive") {
+    const taskFolder = await driveFindChild(storage.rootId, safeRemoteId(id), "application/vnd.google-apps.folder", storage.profile);
+    if (!taskFolder?.id) throw new Error("Task not found");
+    const taskFile = await driveFindChild(taskFolder.id, "task.json", "", storage.profile);
+    if (!taskFile?.id) throw new Error("Task not found");
+    return JSON.parse((await driveDownloadBuffer(taskFile.id, storage.profile)).toString("utf8"));
+  }
+  return JSON.parse(await fsp.readFile(remoteTaskFile(id), "utf8"));
+}
+
+async function readRemoteTask(id, options = {}) {
+  for (const storage of await storageCandidates(options)) {
+    try {
+      const task = await readRemoteTaskFromStorage(id, storage);
+      if (options.email && normalizedEmail(task.storage?.ownerEmail || task.ownerEmail) !== normalizedEmail(options.email)) {
+        continue;
+      }
+      return task;
+    } catch {
+      // Try the next storage root.
+    }
+  }
+  throw new Error("Task not found");
+}
+
+async function writeRemoteTask(task) {
+  task.updatedAt = new Date().toISOString();
+  const storage = await taskStorage(task);
+  if (storage.kind === "drive") {
+    const taskFolderId = await driveEnsureFolder(storage.rootId, task.id, storage.profile);
+    const buffer = Buffer.from(`${JSON.stringify(task, null, 2)}\n`, "utf8");
+    const existing = await driveFindChild(taskFolderId, "task.json", "", storage.profile);
+    if (existing?.id) await driveUpdateBuffer(existing.id, "application/json", buffer, storage.profile);
+    else await driveUploadBuffer(taskFolderId, "task.json", "application/json", buffer, storage.profile);
+    return;
+  }
+  await fsp.mkdir(remoteTaskDir(task.id), { recursive: true });
+  await fsp.writeFile(remoteTaskFile(task.id), `${JSON.stringify(task, null, 2)}\n`, "utf8");
+}
+
+async function saveRemoteBlobInStorage(taskId, folderName, storageName, mime, buffer, storage) {
+  if (storage.kind === "drive") {
+    const taskFolderId = await driveEnsureFolder(storage.rootId, safeRemoteId(taskId), storage.profile);
+    const folderId = await driveEnsureFolder(taskFolderId, folderName, storage.profile);
+    const driveFileId = await driveUploadBuffer(folderId, storageName, mime, buffer, storage.profile);
+    return storage.mode === "personal"
+      ? { driveFileId, driveProfileEmail: storage.ownerEmail }
+      : { driveFileId };
+  }
+  const targetDir = path.join(remoteTaskDir(taskId), folderName);
+  await fsp.mkdir(targetDir, { recursive: true });
+  await fsp.writeFile(path.join(targetDir, storageName), buffer);
+  return { path: `${folderName}/${storageName}` };
+}
+
+async function saveRemoteBlob(taskId, folderName, storageName, mime, buffer, ownerEmail = "") {
+  return saveRemoteBlobInStorage(taskId, folderName, storageName, mime, buffer, await ownerStorage(ownerEmail));
+}
+
+async function saveRemoteBlobForTask(task, folderName, storageName, mime, buffer) {
+  return saveRemoteBlobInStorage(task.id, folderName, storageName, mime, buffer, await taskStorage(task));
+}
+
+async function readRemoteBlob(taskId, file) {
+  if (file.driveProfileEmail) {
+    const profile = await getDriveProfile(file.driveProfileEmail);
+    if (!profile) throw new Error(`Drive profile not found for ${file.driveProfileEmail}`);
+    return driveDownloadBuffer(file.driveFileId, profile);
+  }
+  if (file.driveFileId) return driveDownloadBuffer(file.driveFileId);
+  return fsp.readFile(path.join(remoteTaskDir(taskId), file.path));
+}
+
+function publicRemoteTask(task) {
+  return {
+    id: task.id,
+    status: task.status,
+    prompt: task.prompt,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    claimedAt: task.claimedAt || null,
+    completedAt: task.completedAt || null,
+    error: task.error || null,
+    workerId: task.workerId || null,
+    storage: task.storage || { mode: "default", ownerEmail: task.ownerEmail || null },
+    logs: Array.isArray(task.logs) ? task.logs.slice(-80) : [],
+    files: (task.files || []).map((file) => ({
+      id: file.id,
+      name: file.name,
+      mime: file.mime,
+      size: file.size,
+    })),
+    resultFiles: (task.resultFiles || []).map((file) => ({
+      id: file.id,
+      name: file.name,
+      mime: file.mime,
+      size: file.size,
+      downloadUrl: `/api/remote/tasks/${encodeURIComponent(task.id)}/download?file=${encodeURIComponent(file.id)}`,
+    })),
+  };
+}
+
+async function listRemoteTasksFromStorage(storage) {
+  if (storage.kind === "drive") {
+    const drive = await googleDrive(storage.profile);
+    const response = await drive.files.list({
+      q: `'${driveLiteral(storage.rootId)}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: "files(id,name,modifiedTime)",
+      pageSize: 100,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+    });
+    const tasks = [];
+    for (const folder of response.data.files || []) {
+      try {
+        const taskFile = await driveFindChild(folder.id, "task.json", "", storage.profile);
+        if (!taskFile?.id) continue;
+        tasks.push(JSON.parse((await driveDownloadBuffer(taskFile.id, storage.profile)).toString("utf8")));
+      } catch {
+        // Ignore incomplete task folders.
+      }
+    }
+    return tasks;
+  }
+
+  await fsp.mkdir(remoteJobsDir, { recursive: true });
+  const entries = await fsp.readdir(remoteJobsDir, { withFileTypes: true });
+  const tasks = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      tasks.push(await readRemoteTaskFromStorage(entry.name, storage));
+    } catch {
+      // Ignore incomplete task folders.
+    }
+  }
+  return tasks;
+}
+
+async function listRemoteTasks(options = {}) {
+  const tasksById = new Map();
+  for (const storage of await storageCandidates(options)) {
+    for (const task of await listRemoteTasksFromStorage(storage)) {
+      if (options.email && normalizedEmail(task.storage?.ownerEmail || task.ownerEmail) !== normalizedEmail(options.email)) {
+        continue;
+      }
+      tasksById.set(task.id, task);
+    }
+  }
+  return [...tasksById.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+}
+
+function requireWorker(req, res) {
+  if (!remoteWorkerToken) {
+    json(res, 503, { error: "REMOTE_WORKER_TOKEN is not configured" });
+    return false;
+  }
+  const header = String(req.headers.authorization || "");
+  const token = header.replace(/^Bearer\s+/i, "").trim();
+  if (!token || !timingEqual(token, remoteWorkerToken)) {
+    json(res, 401, { error: "Worker authentication required" });
+    return false;
+  }
+  return true;
+}
+
+function decodeUploadFile(input, runningTotal) {
+  const name = safeFileName(input?.name);
+  const mime = String(input?.mime || "application/octet-stream").slice(0, 120);
+  const base64 = String(input?.base64 || "");
+  const buffer = Buffer.from(base64, "base64");
+  if (!buffer.length) throw new Error(`File is empty: ${name}`);
+  if (buffer.length > remoteFileLimitBytes) throw new Error(`File is too large: ${name}`);
+  if (runningTotal + buffer.length > remoteTotalLimitBytes) throw new Error("Task upload is too large");
+  return { name, mime, buffer };
+}
+
+async function handleRemoteTaskCreate(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const body = await readBody(req);
+  const prompt = String(body.prompt || "").trim();
+  const uploads = Array.isArray(body.files) ? body.files : [];
+  if (!prompt && !uploads.length) {
+    json(res, 400, { error: "Prompt or at least one file is required" });
+    return;
+  }
+  const id = remoteTaskId();
+  const selectedStorage = await ownerStorage(session.email);
+  const llmProfile = await getLlmProfile(session.email);
+  const storage = selectedStorage.mode === "personal"
+    ? {
+      mode: "personal",
+      ownerEmail: normalizedEmail(session.email),
+      folderId: selectedStorage.rootId,
+      folderName: selectedStorage.folderName,
+    }
+    : {
+      mode: selectedStorage.mode,
+      ownerEmail: normalizedEmail(session.email),
+      folderId: selectedStorage.rootId || null,
+      folderName: selectedStorage.folderName,
+    };
+
+  let totalBytes = 0;
+  const files = [];
+  for (const [index, upload] of uploads.entries()) {
+    const decoded = decodeUploadFile(upload, totalBytes);
+    totalBytes += decoded.buffer.length;
+    const fileId = `in-${index + 1}-${crypto.randomBytes(4).toString("hex")}`;
+    const storageName = `${fileId}-${decoded.name}`;
+    const stored = await saveRemoteBlob(id, "inputs", storageName, decoded.mime, decoded.buffer, session.email);
+    files.push({
+      id: fileId,
+      name: decoded.name,
+      mime: decoded.mime,
+      size: decoded.buffer.length,
+      ...stored,
+    });
+  }
+
+  const now = new Date().toISOString();
+  const task = {
+    id,
+    status: "queued",
+    prompt,
+    ownerEmail: session.email,
+    storage,
+    llmProfile: publicLlmProfile(llmProfile),
+    files,
+    resultFiles: [],
+    logs: [{ at: now, message: `Task created using ${storage.mode === "personal" ? "personal Google Drive" : useDriveStorage() ? "default Google Drive" : "local Render filesystem"} storage` }],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await writeRemoteTask(task);
+  json(res, 201, { task: publicRemoteTask(task) });
+}
+
+async function handleRemoteTaskList(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const tasks = await listRemoteTasks({ email: session.email });
+  json(res, 200, { tasks: tasks.map(publicRemoteTask) });
+}
+
+async function handleRemoteTaskGet(req, res, id) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const task = await readRemoteTask(id, { email: session.email });
+  json(res, 200, { task: publicRemoteTask(task) });
+}
+
+async function handleRemoteTaskDownload(req, res, id, url) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const task = await readRemoteTask(id, { email: session.email });
+  const fileId = String(url.searchParams.get("file") || "");
+  const file = (task.resultFiles || []).find((item) => item.id === fileId);
+  if (!file) {
+    json(res, 404, { error: "Result file not found" });
+    return;
+  }
+  const body = await readRemoteBlob(id, file);
+  res.writeHead(200, {
+    "content-type": file.mime || "application/octet-stream",
+    "content-length": body.length,
+    "content-disposition": `attachment; filename="${safeFileName(file.name).replace(/"/g, "")}"`,
+  });
+  res.end(body);
+}
+
+async function handleWorkerNext(req, res) {
+  if (!requireWorker(req, res)) return;
+  const workerId = String(req.headers["x-worker-id"] || "local-worker").slice(0, 80);
+  const tasks = await listRemoteTasks({ includeAll: true });
+  const task = tasks.reverse().find((item) => item.status === "queued");
+  if (!task) {
+    json(res, 200, { task: null });
+    return;
+  }
+  task.status = "running";
+  task.workerId = workerId;
+  task.claimedAt = new Date().toISOString();
+  task.logs = [...(task.logs || []), { at: task.claimedAt, message: `Claimed by ${workerId}` }];
+  const llmProfile = await getLlmProfile(task.storage?.ownerEmail || task.ownerEmail);
+  await writeRemoteTask(task);
+
+  const files = [];
+  for (const file of task.files || []) {
+    const buffer = await readRemoteBlob(task.id, file);
+    files.push({
+      id: file.id,
+      name: file.name,
+      mime: file.mime,
+      size: file.size,
+      base64: buffer.toString("base64"),
+    });
+  }
+  json(res, 200, {
+    task: {
+      id: task.id,
+      prompt: task.prompt,
+      createdAt: task.createdAt,
+      llmProfile: workerLlmProfile(llmProfile),
+      files,
+    },
+  });
+}
+
+async function handleWorkerLog(req, res, id) {
+  if (!requireWorker(req, res)) return;
+  const body = await readBody(req);
+  const task = await readRemoteTask(id, { includeAll: true });
+  const message = String(body.message || "").trim().slice(0, 4000);
+  if (message) {
+    task.logs = [...(task.logs || []), { at: new Date().toISOString(), message }];
+    await writeRemoteTask(task);
+  }
+  json(res, 200, { ok: true });
+}
+
+async function handleWorkerComplete(req, res, id) {
+  if (!requireWorker(req, res)) return;
+  const body = await readBody(req);
+  const task = await readRemoteTask(id, { includeAll: true });
+
+  const resultFiles = [];
+  let totalBytes = 0;
+  if (body.transcript) {
+    const transcript = Buffer.from(String(body.transcript), "utf8");
+    const fileId = `out-transcript-${crypto.randomBytes(4).toString("hex")}`;
+    const storageName = `${fileId}-transcript.txt`;
+    const stored = await saveRemoteBlobForTask(task, "outputs", storageName, "text/plain; charset=utf-8", transcript);
+    resultFiles.push({
+      id: fileId,
+      name: "transcript.txt",
+      mime: "text/plain; charset=utf-8",
+      size: transcript.length,
+      ...stored,
+    });
+    totalBytes += transcript.length;
+  }
+
+  for (const [index, upload] of (Array.isArray(body.files) ? body.files : []).entries()) {
+    const decoded = decodeUploadFile(upload, totalBytes);
+    totalBytes += decoded.buffer.length;
+    const fileId = `out-${index + 1}-${crypto.randomBytes(4).toString("hex")}`;
+    const storageName = `${fileId}-${decoded.name}`;
+    const stored = await saveRemoteBlobForTask(task, "outputs", storageName, decoded.mime, decoded.buffer);
+    resultFiles.push({
+      id: fileId,
+      name: decoded.name,
+      mime: decoded.mime,
+      size: decoded.buffer.length,
+      ...stored,
+    });
+  }
+
+  task.status = body.status === "failed" ? "failed" : "done";
+  task.error = task.status === "failed" ? String(body.error || "Worker failed").slice(0, 4000) : null;
+  task.completedAt = new Date().toISOString();
+  task.resultFiles = resultFiles;
+  task.logs = [
+    ...(task.logs || []),
+    { at: task.completedAt, message: task.status === "done" ? "Task completed" : `Task failed: ${task.error}` },
+  ];
+  await writeRemoteTask(task);
+  json(res, 200, { ok: true, task: publicRemoteTask(task) });
+}
+
+function runCapture(command, args, { timeoutMs = 15000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { cwd: __dirname, windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      killProcessTree(child.pid);
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: error.message });
+    });
+  });
+}
+
+async function ensureContinueService() {
+  const command = cnExecutable();
+  if (!fs.existsSync(command)) {
+    continueStatus = { ok: false, checkedAt: new Date().toISOString(), error: `Continue CLI binary not found: ${command}` };
+    return continueStatus;
+  }
+  const result = await runCapture(command, ["--version"], { timeoutMs: 15000 });
+  continueStatus = {
+    ok: result.code === 0,
+    checkedAt: new Date().toISOString(),
+    command,
+    version: (result.stdout || result.stderr).trim(),
+    error: result.code === 0 ? null : (result.stderr || result.stdout || `exit ${result.code}`).trim(),
+  };
+  return continueStatus;
+}
+
 function killProcessTree(pid) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -276,7 +1549,14 @@ async function handleAgent(req, res) {
   }
 
   await ensureWorkspace();
+  if (!continueStatus.ok) await ensureContinueService();
+  if (!continueStatus.ok) {
+    json(res, 503, { error: continueStatus.error || "Continue CLI is not ready" });
+    return;
+  }
   const id = body.runId || runId();
+  const chat = await ensureChat(body.chatId, prompt);
+  await appendChatMessage(chat.id, { role: "user", content: prompt });
   const mode = body.model === "grok-4.3" ? "analysis" : "coding";
   const configPath = mode === "analysis" ? analysisConfigPath : codingConfigPath;
   const modelHint = mode === "analysis"
@@ -314,7 +1594,16 @@ async function handleAgent(req, res) {
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
   });
-  sse(res, "meta", { runId: id, stage: "started", workspace, mode });
+  sse(res, "meta", { runId: id, chatId: chat.id, stage: "started", workspace, mode });
+  let assistantText = "";
+  let savedAssistant = false;
+
+  async function saveAssistantOnce() {
+    if (savedAssistant) return;
+    savedAssistant = true;
+    const text = assistantText.trim();
+    if (text) await appendChatMessage(chat.id, { role: "assistant", content: text });
+  }
 
   req.on("close", () => {
     if (!res.writableEnded && activeRuns.has(id)) {
@@ -323,15 +1612,24 @@ async function handleAgent(req, res) {
     }
   });
 
-  child.stdout.on("data", (chunk) => sse(res, "token", { token: chunk.toString("utf8") }));
-  child.stderr.on("data", (chunk) => sse(res, "stderr", { token: chunk.toString("utf8") }));
+  child.stdout.on("data", (chunk) => {
+    const token = chunk.toString("utf8");
+    assistantText += token;
+    sse(res, "token", { token });
+  });
+  child.stderr.on("data", (chunk) => {
+    const token = chunk.toString("utf8");
+    assistantText += token;
+    sse(res, "stderr", { token });
+  });
   child.on("error", (error) => {
     activeRuns.delete(id);
     sse(res, "error", { error: error.message });
     res.end();
   });
-  child.on("close", (code) => {
+  child.on("close", async (code) => {
     activeRuns.delete(id);
+    await saveAssistantOnce().catch((error) => sse(res, "error", { error: `Chat save failed: ${error.message}` }));
     sse(res, "done", { code });
     res.end();
   });
@@ -400,7 +1698,40 @@ const server = http.createServer(async (req, res) => {
         smtp: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
         repo: process.env.WORKSPACE_REPO_URL || null,
         activeRuns: activeRuns.size,
+        remote: {
+          storage: useDriveStorage() ? "google-drive" : "local-render-filesystem",
+          driveAuthMode: useDriveStorage() ? (authModeUsesOAuth() ? "oauth" : "service_account") : null,
+          googleDriveFolderId,
+          workerToken: Boolean(remoteWorkerToken),
+          fileLimitBytes: remoteFileLimitBytes,
+          totalLimitBytes: remoteTotalLimitBytes,
+          driveConnectEnabled: googleDriveConnectEnabled,
+          usePersonalProfiles: googleDriveUsePersonalProfiles,
+          ownerResourceFallbackEnabled,
+        },
       });
+    }
+    if (req.method === "GET" && url.pathname === "/api/drive/profile") return await handleDriveProfile(req, res);
+    if (req.method === "POST" && url.pathname === "/api/drive/connect/start") return await handleDriveConnectStart(req, res);
+    if (req.method === "GET" && url.pathname === "/api/drive/callback") return await handleDriveCallback(req, res, url);
+    if (req.method === "GET" && url.pathname === "/api/llm/profile") return await handleLlmProfileGet(req, res);
+    if (req.method === "PUT" && url.pathname === "/api/llm/profile") return await handleLlmProfilePut(req, res);
+    if (req.method === "DELETE" && url.pathname === "/api/llm/profile") return await handleLlmProfileDelete(req, res);
+    if (req.method === "POST" && url.pathname === "/api/remote/tasks") return await handleRemoteTaskCreate(req, res);
+    if (req.method === "GET" && url.pathname === "/api/remote/tasks") return await handleRemoteTaskList(req, res);
+    const remoteDownloadMatch = url.pathname.match(/^\/api\/remote\/tasks\/([^/]+)\/download$/);
+    if (req.method === "GET" && remoteDownloadMatch) {
+      return await handleRemoteTaskDownload(req, res, remoteDownloadMatch[1], url);
+    }
+    const remoteTaskMatch = url.pathname.match(/^\/api\/remote\/tasks\/([^/]+)$/);
+    if (req.method === "GET" && remoteTaskMatch) return await handleRemoteTaskGet(req, res, remoteTaskMatch[1]);
+    if (req.method === "GET" && url.pathname === "/api/worker/next") return await handleWorkerNext(req, res);
+    const workerTaskMatch = url.pathname.match(/^\/api\/worker\/tasks\/([^/]+)\/(log|complete)$/);
+    if (req.method === "POST" && workerTaskMatch?.[2] === "log") {
+      return await handleWorkerLog(req, res, workerTaskMatch[1]);
+    }
+    if (req.method === "POST" && workerTaskMatch?.[2] === "complete") {
+      return await handleWorkerComplete(req, res, workerTaskMatch[1]);
     }
     if (req.method === "POST" && url.pathname === "/api/agent") return await handleAgent(req, res);
     if (req.method === "POST" && url.pathname === "/api/stop") return await stopRun(req, res);
