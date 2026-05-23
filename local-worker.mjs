@@ -821,6 +821,14 @@ import traceback
 import types
 from pathlib import Path
 
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 translator_path = Path(sys.argv[1])
 input_dir = Path(sys.argv[2])
 output_dir = Path(sys.argv[3])
@@ -841,7 +849,8 @@ sys.modules[module.__name__] = module
 exec(compile(source, str(translator_path), "exec"), module.__dict__)
 
 def log(message, level="INFO"):
-    print(f"[{level}] {message}", flush=True)
+    safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    print(f"[{level}] {safe_message}", flush=True)
 
 module.pump_ui_events = lambda: None
 module.wait_if_paused = lambda reason="": None
@@ -921,6 +930,8 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
     LM_STUDIO_FULL_RESTART: process.env.LM_STUDIO_FULL_RESTART || "0",
     LM_STUDIO_STOP_AFTER_SESSION: process.env.LM_STUDIO_STOP_AFTER_SESSION || "0",
     LM_MODEL_CLEAN_START_DELAY_SECONDS: process.env.LM_MODEL_CLEAN_START_DELAY_SECONDS || "0",
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
     NO_COLOR: "1",
   };
   const args = [
