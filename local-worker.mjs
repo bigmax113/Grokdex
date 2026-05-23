@@ -309,8 +309,12 @@ function xliffTranslatorEnv() {
     XLIFF_TERMINOLOGY_LOCK_ENABLED: process.env.XLIFF_TERMINOLOGY_LOCK_ENABLED || "1",
     XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS: process.env.XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS || "1",
     XLIFF_TERMINOLOGY_AUDIT_ONLY: process.env.XLIFF_TERMINOLOGY_AUDIT_ONLY || "0",
-    XLIFF_POST_BATCH_AUDIT_ENABLED: process.env.XLIFF_POST_BATCH_AUDIT_ENABLED || "1",
-    XLIFF_TAG_THINKING_REPAIR_ENABLED: process.env.XLIFF_TAG_THINKING_REPAIR_ENABLED || "1",
+    XLIFF_TERMINOLOGY_MAX_TERMS_PER_BLOCK: process.env.REMOTE_XLIFF_TERMINOLOGY_MAX_TERMS_PER_BLOCK || "30",
+    XLIFF_TERMINOLOGY_MAX_BASE_TERMS: process.env.REMOTE_XLIFF_TERMINOLOGY_MAX_BASE_TERMS || "1200",
+    XLIFF_TERMINOLOGY_DOCUMENT_CANDIDATE_LIMIT: process.env.REMOTE_XLIFF_TERMINOLOGY_DOCUMENT_CANDIDATE_LIMIT || "60",
+    XLIFF_TERMINOLOGY_PLANNING_MAX_TOKENS: process.env.REMOTE_XLIFF_TERMINOLOGY_PLANNING_MAX_TOKENS || "2500",
+    XLIFF_POST_BATCH_AUDIT_ENABLED: process.env.REMOTE_XLIFF_POST_BATCH_AUDIT_ENABLED || process.env.XLIFF_POST_BATCH_AUDIT_ENABLED || "0",
+    XLIFF_TAG_THINKING_REPAIR_ENABLED: process.env.REMOTE_XLIFF_TAG_THINKING_REPAIR_ENABLED || process.env.XLIFF_TAG_THINKING_REPAIR_ENABLED || "0",
     TMX_GOOGLE_DRIVE_ENABLED: tmxDriveEnabled,
     TMX_FOLDER: process.env.REMOTE_XLIFF_TMX_FOLDER || "",
     TMX_APPLY_EXACT_MATCHES: process.env.REMOTE_XLIFF_TMX_APPLY_EXACT_MATCHES || "0",
@@ -663,7 +667,7 @@ function xliffTranslationPolicyBlock(task, inputFiles) {
     `Runtime XLIFF budget for this worker: LM_CONTEXT_WINDOW=${xliffTranslationContextWindow}, LM_BATCH_SOURCE_TOKENS=${xliffTranslationSourceTokens}, LM_MAX_UNITS_PER_BLOCK=${xliffTranslationMaxUnits}, LM_FULL_CONTEXT_MIN_OUTPUT_TOKENS=${xliffTranslationMinOutputTokens}, LM_FULL_CONTEXT_TARGET_OUTPUT_TOKENS=${xliffTranslationOutputTokens}.`,
     "This applies to every document format: DOCX paragraphs, PDF lines, XLSX cells/rows/sheets, PPTX text boxes/shapes/slides, HTML/XML nodes, and archives of mixed documents must all be converted to XLIFF first and translated as batched trans-units.",
     "Do not translate line-by-line, row-by-row, cell-by-cell, paragraph-by-paragraph, textbox-by-textbox, slide-by-slide, page-by-page, or one trans-unit per model call unless the reference implementation's fallback split is triggered by marker failure or post-batch audit failure.",
-    "Do not skip terminology unification. Keep XLIFF_TERMINOLOGY_LOCK_ENABLED=1, XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS=1, DOCUMENT_TRANSLATION_CACHE_ENABLED=1, and XLIFF_POST_BATCH_AUDIT_ENABLED=1. Do not use TMX or embedding memory for this remote test mode unless the user explicitly enables them.",
+    "Do not skip terminology unification. Keep XLIFF_TERMINOLOGY_LOCK_ENABLED=1, XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS=1, and DOCUMENT_TRANSLATION_CACHE_ENABLED=1. In the remote test mode, avoid recursive post-batch retranslation and model-based smart tag repair unless the user explicitly enables them.",
     "For DOCX use the reference-style flow: docx_to_xliff -> translate_xliff_file -> xliff_to_docx.",
     "For PDF use the reference-style flow: pdf_to_xliff -> translate_xliff_file -> xliff_to_pdf_page_aware.",
     "For a mixed folder/archive, unpack it first, process every supported document through the XLIFF flow, preserve relative paths, and put all final documents plus useful XLIFF/audit artifacts into the output directory.",
@@ -839,6 +843,7 @@ async function runContinue(taskId, prompt, runConfig) {
 function directXliffRunnerScript() {
   return String.raw`
 import json
+import html
 import os
 import re
 import shutil
@@ -884,11 +889,17 @@ def env_flag(name, default=False):
 def apply_direct_runtime_overrides():
     embedding_enabled = env_flag("LM_EMBEDDING_MEMORY_ENABLED", False)
     embedding_cache_enabled = env_flag("LM_EMBEDDING_CACHE_ENABLED", False)
+    post_batch_audit_enabled = env_flag("XLIFF_POST_BATCH_AUDIT_ENABLED", False)
+    tag_thinking_repair_enabled = env_flag("XLIFF_TAG_THINKING_REPAIR_ENABLED", False)
     try:
         module.EMBEDDING_MEMORY_ENABLED = embedding_enabled
         module.EMBEDDING_CACHE_ENABLED = embedding_cache_enabled
         module._RUNTIME_EMBEDDING_MEMORY_ENABLED = embedding_enabled
         module.use_embedding_memory = lambda: embedding_enabled
+        module.XLIFF_POST_BATCH_AUDIT_ENABLED = post_batch_audit_enabled
+        module._RUNTIME_XLIFF_POST_BATCH_AUDIT_ENABLED = post_batch_audit_enabled
+        module.XLIFF_TAG_THINKING_REPAIR_ENABLED = tag_thinking_repair_enabled
+        module._RUNTIME_XLIFF_TAG_THINKING_REPAIR_ENABLED = tag_thinking_repair_enabled
     except Exception:
         pass
 
@@ -901,6 +912,10 @@ def apply_direct_runtime_overrides():
                 module.EMBEDDING_CACHE_ENABLED = embedding_cache_enabled
                 module._RUNTIME_EMBEDDING_MEMORY_ENABLED = embedding_enabled
                 module.use_embedding_memory = lambda: embedding_enabled
+                module.XLIFF_POST_BATCH_AUDIT_ENABLED = post_batch_audit_enabled
+                module._RUNTIME_XLIFF_POST_BATCH_AUDIT_ENABLED = post_batch_audit_enabled
+                module.XLIFF_TAG_THINKING_REPAIR_ENABLED = tag_thinking_repair_enabled
+                module._RUNTIME_XLIFF_TAG_THINKING_REPAIR_ENABLED = tag_thinking_repair_enabled
             except Exception:
                 pass
         module.sync_runtime_options_from_gui = sync_runtime_options_from_env
@@ -993,6 +1008,69 @@ def output_prefix_for(file_path):
     prefix = "__".join(re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._") for part in parts[-4:])
     return f"{prefix}__" if prefix else ""
 
+def docx_text_sample(path, limit=60000):
+    chunks = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [
+                name for name in archive.namelist()
+                if name.startswith("word/") and name.endswith(".xml")
+            ]
+            for name in names:
+                raw = archive.read(name).decode("utf-8", errors="ignore")
+                text = re.sub(r"<[^>]+>", " ", raw)
+                text = html.unescape(re.sub(r"\s+", " ", text)).strip()
+                if text:
+                    chunks.append(text)
+                if sum(len(item) for item in chunks) >= limit:
+                    break
+    except Exception:
+        return ""
+    return " ".join(chunks)[:limit]
+
+def pdf_text_sample(path, limit=60000):
+    try:
+        import pymupdf as fitz
+    except Exception:
+        try:
+            import fitz
+        except Exception:
+            return ""
+    chunks = []
+    try:
+        with fitz.open(str(path)) as document:
+            for page in document[: min(5, len(document))]:
+                text = page.get_text("text") or ""
+                if text:
+                    chunks.append(text)
+                if sum(len(item) for item in chunks) >= limit:
+                    break
+    except Exception:
+        return ""
+    return " ".join(chunks)[:limit]
+
+def text_sample_for_language(path):
+    if path.suffix.lower() == ".docx":
+        return docx_text_sample(path)
+    if path.suffix.lower() == ".pdf":
+        return pdf_text_sample(path)
+    return ""
+
+def detect_source_language(path, fallback):
+    lower_name = path.name.lower()
+    if re.search(r"(^|[\\s_.()\\-])en([\\s_.()\\-]|$)|english", lower_name):
+        return "en"
+    if re.search(r"(^|[\\s_.()\\-])ru([\\s_.()\\-]|$)|russian", lower_name):
+        return "ru"
+    sample = text_sample_for_language(path)
+    cyrillic = len(re.findall(r"[\u0400-\u04ff]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    if cyrillic >= 30 and cyrillic >= latin * 0.18:
+        return "ru"
+    if latin >= 80 and cyrillic < 30:
+        return "en"
+    return fallback
+
 def copy_result(path, prefix=""):
     path = Path(path)
     if not path.exists() or not path.is_file():
@@ -1017,14 +1095,19 @@ try:
         log(f"Direct XLIFF translation started: {source_lang}->{target_lang}; files={len(files)}")
         for file_path in files:
             suffix = file_path.suffix.lower()
-            log(f"Processing {file_path.name} via reference XLIFF pipeline")
             prefix = output_prefix_for(file_path)
+            file_source_lang = detect_source_language(file_path, source_lang)
+            if file_source_lang == target_lang:
+                log(f"Skipping {file_path.name}: detected source language is already {target_lang}; copying original to results")
+                copy_result(file_path, prefix)
+                continue
+            log(f"Processing {file_path.name} via reference XLIFF pipeline ({file_source_lang}->{target_lang})")
             if suffix == ".docx":
-                translated_xliff, translated_doc = module.process_docx_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
+                translated_xliff, translated_doc = module.process_docx_pipeline(str(file_path), file_source_lang, target_lang, work_root=output_dir)
                 copy_result(translated_xliff, prefix)
                 copy_result(translated_doc, prefix)
             elif suffix == ".pdf":
-                translated_xliff, translated_pdf = module.process_pdf_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
+                translated_xliff, translated_pdf = module.process_pdf_pipeline(str(file_path), file_source_lang, target_lang, work_root=output_dir)
                 copy_result(translated_xliff, prefix)
                 copy_result(translated_pdf, prefix)
             else:
@@ -1074,7 +1157,13 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
     LM_EMBEDDING_MEMORY_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_MEMORY_ENABLED || "0",
     LM_EMBEDDING_CACHE_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_CACHE_ENABLED || "0",
     LM_EMBEDDING_MAX_TMX_REFERENCES: process.env.REMOTE_XLIFF_EMBEDDING_MAX_TMX_REFERENCES || "0",
+    XLIFF_POST_BATCH_AUDIT_ENABLED: process.env.REMOTE_XLIFF_POST_BATCH_AUDIT_ENABLED || "0",
+    XLIFF_TAG_THINKING_REPAIR_ENABLED: process.env.REMOTE_XLIFF_TAG_THINKING_REPAIR_ENABLED || "0",
     XLIFF_SMART_TAG_REPAIR_CLEAN_LOCAL_SESSION: process.env.REMOTE_XLIFF_SMART_TAG_REPAIR_CLEAN_LOCAL_SESSION || "0",
+    XLIFF_TERMINOLOGY_MAX_TERMS_PER_BLOCK: process.env.REMOTE_XLIFF_TERMINOLOGY_MAX_TERMS_PER_BLOCK || "30",
+    XLIFF_TERMINOLOGY_MAX_BASE_TERMS: process.env.REMOTE_XLIFF_TERMINOLOGY_MAX_BASE_TERMS || "1200",
+    XLIFF_TERMINOLOGY_DOCUMENT_CANDIDATE_LIMIT: process.env.REMOTE_XLIFF_TERMINOLOGY_DOCUMENT_CANDIDATE_LIMIT || "60",
+    XLIFF_TERMINOLOGY_PLANNING_MAX_TOKENS: process.env.REMOTE_XLIFF_TERMINOLOGY_PLANNING_MAX_TOKENS || "2500",
     PYTHONUTF8: "1",
     PYTHONIOENCODING: "utf-8",
     NO_COLOR: "1",
