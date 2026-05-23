@@ -727,6 +727,85 @@ async function listResultFiles(dir) {
   return out;
 }
 
+function openXmlPackageInfo(dir) {
+  if (!fs.existsSync(path.join(dir, "[Content_Types].xml"))) return null;
+  if (fs.existsSync(path.join(dir, "ppt", "presentation.xml"))) {
+    return { ext: ".pptx", defaultName: "repaired-presentation.pptx", roots: ["[Content_Types].xml", "_rels", "docProps", "ppt"] };
+  }
+  if (fs.existsSync(path.join(dir, "word", "document.xml"))) {
+    return { ext: ".docx", defaultName: "repaired-document.docx", roots: ["[Content_Types].xml", "_rels", "docProps", "word", "customXml"] };
+  }
+  if (fs.existsSync(path.join(dir, "xl", "workbook.xml"))) {
+    return { ext: ".xlsx", defaultName: "repaired-workbook.xlsx", roots: ["[Content_Types].xml", "_rels", "docProps", "xl", "customXml"] };
+  }
+  return null;
+}
+
+async function collectOpenXmlPackageEntries(packageDir, roots) {
+  const entries = [];
+
+  async function addPath(relative) {
+    const fullPath = path.join(packageDir, relative);
+    const stat = await fsp.stat(fullPath).catch(() => null);
+    if (!stat) return;
+    if (stat.isDirectory()) {
+      const children = await fsp.readdir(fullPath, { withFileTypes: true });
+      for (const child of children) await addPath(path.join(relative, child.name));
+      return;
+    }
+    if (!stat.isFile() || !stat.size) return;
+    entries.push({
+      relativePath: relative.replace(/\\/g, "/"),
+      buffer: await fsp.readFile(fullPath),
+    });
+  }
+
+  for (const root of roots) await addPath(root);
+  return entries;
+}
+
+function repairedOpenXmlName(task, info, packageDir, outputDir) {
+  if (packageDir !== outputDir) {
+    return `${safeName(path.basename(packageDir).replace(/\.[^.]+$/, ""))}${info.ext}`;
+  }
+  const source = (task.files || []).find((file) => path.extname(file.name).toLowerCase() === info.ext);
+  if (!source) return info.defaultName;
+  return `${safeName(path.basename(source.name, info.ext))}_processed${info.ext}`;
+}
+
+async function repairOpenXmlPackageOutputs(task, outputDir) {
+  const candidates = [outputDir];
+  const firstLevel = await fsp.readdir(outputDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of firstLevel) {
+    if (entry.isDirectory()) candidates.push(path.join(outputDir, entry.name));
+  }
+
+  const repaired = [];
+  for (const dir of candidates) {
+    const info = openXmlPackageInfo(dir);
+    if (!info) continue;
+    const entries = await collectOpenXmlPackageEntries(dir, info.roots);
+    if (!entries.length) continue;
+    const fileName = repairedOpenXmlName(task, info, dir, outputDir);
+    const target = path.join(outputDir, fileName);
+    const buffer = zipFilesBuffer(entries);
+    await fsp.writeFile(target, buffer);
+    repaired.push(fileName);
+  }
+  return repaired;
+}
+
+function isRawOpenXmlPackagePart(relativePath) {
+  const value = String(relativePath || "").replace(/\\/g, "/");
+  return value === "[Content_Types].xml"
+    || value.startsWith("_rels/")
+    || value.startsWith("docProps/")
+    || value.startsWith("ppt/")
+    || value.startsWith("word/")
+    || value.startsWith("xl/")
+    || value.startsWith("customXml/");
+}
+
 async function collectResultFiles(dir, { onlyArchive = false } = {}) {
   if (onlyArchive) {
     const archivePath = path.join(dir, "results.zip");
@@ -748,9 +827,11 @@ async function collectResultFiles(dir, { onlyArchive = false } = {}) {
   })));
 }
 
-async function packageOutputArchive(outputDir) {
+async function packageOutputArchive(outputDir, { excludeRawOpenXmlParts = false } = {}) {
   if (!packageResults) return false;
-  const files = (await listResultFiles(outputDir)).filter((file) => file.relativePath !== "results.zip");
+  const files = (await listResultFiles(outputDir))
+    .filter((file) => file.relativePath !== "results.zip")
+    .filter((file) => !excludeRawOpenXmlParts || !isRawOpenXmlPackagePart(file.relativePath));
   if (!files.length) return false;
   const zipEntries = await Promise.all(files.map(async (file) => ({
     name: file.name,
@@ -801,7 +882,12 @@ async function processTask(task) {
       await fsp.writeFile(path.join(outputDir, "result.md"), `${fallback}\n`, "utf8");
       outputFiles = await listResultFiles(outputDir);
     }
-    const archived = await packageOutputArchive(outputDir);
+    const repairedOpenXml = await repairOpenXmlPackageOutputs(task, outputDir);
+    if (repairedOpenXml.length) {
+      await logRemote(task.id, `Repaired OpenXML package output(s): ${repairedOpenXml.join(", ")}`);
+      outputFiles = await listResultFiles(outputDir);
+    }
+    const archived = await packageOutputArchive(outputDir, { excludeRawOpenXmlParts: repairedOpenXml.length > 0 });
     const files = await collectResultFiles(outputDir, { onlyArchive: archived });
 
     await completeTask(task.id, { status: "done", transcript, files });
