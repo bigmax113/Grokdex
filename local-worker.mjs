@@ -8,6 +8,17 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(process.env.REMOTE_WORKER_WORKSPACE || path.dirname(__dirname));
 const localStackRoot = path.join(projectRoot, "local-agent-stack");
+const envFiles = String(process.env.REMOTE_WORKER_ENV_FILES || [
+  path.join(localStackRoot, ".env"),
+  path.join(__dirname, ".env"),
+  path.join(os.homedir(), ".continue", ".env"),
+  path.join(os.homedir(), ".openclaw", ".env"),
+  path.join(os.homedir(), ".openclaw", "config", ".env"),
+  path.join(os.homedir(), ".openclaw", "credentials", ".env"),
+].join(path.delimiter)).split(path.delimiter).filter(Boolean);
+
+loadEnvFiles(envFiles);
+
 const renderUrl = String(process.env.RENDER_AGENT_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
 const workerToken = process.env.REMOTE_WORKER_TOKEN || "";
 const workerId = process.env.REMOTE_WORKER_ID || `${os.hostname()}-${process.pid}`;
@@ -25,19 +36,9 @@ const lmStudioSwitchBase = String(process.env.LMSTUDIO_SWITCH_BASE || "http://12
 const ensureProxyScript = path.join(projectRoot, "ensure-lmstudio-switch-proxy.ps1");
 const xliffReferenceScript = process.env.XLIFF_TRANSLATOR_REFERENCE_SCRIPT
   || "C:\\codex\\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py";
-const envFiles = String(process.env.REMOTE_WORKER_ENV_FILES || [
-  path.join(localStackRoot, ".env"),
-  path.join(__dirname, ".env"),
-  path.join(os.homedir(), ".continue", ".env"),
-  path.join(os.homedir(), ".openclaw", ".env"),
-  path.join(os.homedir(), ".openclaw", "config", ".env"),
-  path.join(os.homedir(), ".openclaw", "credentials", ".env"),
-].join(path.delimiter)).split(path.delimiter).filter(Boolean);
 
 if (!renderUrl) throw new Error("RENDER_AGENT_URL or BASE_URL is required");
 if (!workerToken) throw new Error("REMOTE_WORKER_TOKEN is required");
-
-loadEnvFiles(envFiles);
 
 function loadEnvFiles(files) {
   for (const file of files) {
