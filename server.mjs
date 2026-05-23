@@ -2176,7 +2176,10 @@ async function serveStatic(req, res, url) {
   }
   try {
     const body = await fsp.readFile(filePath);
-    res.writeHead(200, { "content-type": contentType(filePath) });
+    res.writeHead(200, {
+      "content-type": contentType(filePath),
+      "cache-control": "no-store",
+    });
     res.end(body);
   } catch {
     json(res, 404, { error: "Not found" });
