@@ -56,7 +56,8 @@ async function refreshMe() {
 async function refreshStatus() {
   const status = await api("/api/status");
   const activeModels = (status.remote?.models || []).filter((model) => model.active).map((model) => model.id).join(", ");
-  $("runtime").textContent = `${status.email} - ${status.workspace} - local models: ${activeModels || "none"} - SMTP ${status.smtp ? "ready" : "missing"}`;
+  const mailer = status.mailer === "gmail-oauth" ? "Gmail OAuth" : status.smtp ? "SMTP" : "missing";
+  $("runtime").textContent = `${status.email} - ${status.workspace} - local models: ${activeModels || "none"} - mail ${mailer}`;
 }
 
 async function sendCode() {

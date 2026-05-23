@@ -221,11 +221,25 @@ function requireSession(req, res) {
   return null;
 }
 
+function smtpConfigured() {
+  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+function gmailOAuthMailerConfigured() {
+  return authModeUsesOAuth() && hasGoogleOAuthCredentials();
+}
+
+function mailerMode() {
+  if (smtpConfigured()) return "smtp";
+  if (gmailOAuthMailerConfigured()) return "gmail-oauth";
+  return "missing";
+}
+
 function transporter() {
   const host = process.env.SMTP_HOST;
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
-  if (!host || !user || !pass) {
+  if (!smtpConfigured()) {
     throw new Error("SMTP is not configured");
   }
   return nodemailer.createTransport({
@@ -234,6 +248,52 @@ function transporter() {
     secure: String(process.env.SMTP_SECURE || "false") === "true",
     auth: { user, pass },
   });
+}
+
+function rfc2822(value) {
+  return String(value || "").replace(/[\r\n]+/g, " ").trim();
+}
+
+async function sendGmailOAuthMail({ to, subject, text }) {
+  if (!gmailOAuthMailerConfigured()) throw new Error("Gmail OAuth mailer is not configured");
+  const { google } = await import("googleapis");
+  const clientSource = parseGoogleOAuthClient();
+  const client = clientSource.installed || clientSource.web || clientSource;
+  const authClient = new google.auth.OAuth2(
+    client.client_id,
+    client.client_secret,
+    googleDriveOAuthRedirectUri || (Array.isArray(client.redirect_uris) ? client.redirect_uris[0] : undefined),
+  );
+  authClient.setCredentials(parseGoogleOAuthToken());
+  const gmail = google.gmail({ version: "v1", auth: authClient });
+  const raw = [
+    `To: ${rfc2822(to)}`,
+    `From: ${rfc2822(process.env.SMTP_FROM || otpEmail)}`,
+    `Subject: ${rfc2822(subject)}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    text,
+  ].join("\r\n");
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw: Buffer.from(raw, "utf8").toString("base64url") },
+  });
+}
+
+async function sendOtpMail(code) {
+  const subject = "Continue Render Agent login code";
+  const text = `Your Continue Render Agent login code is ${code}. It expires in 10 minutes.`;
+  if (smtpConfigured()) {
+    await transporter().sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: otpEmail,
+      subject,
+      text,
+    });
+    return;
+  }
+  await sendGmailOAuthMail({ to: otpEmail, subject, text });
 }
 
 async function sendLoginCode(req, res) {
@@ -258,12 +318,7 @@ async function sendLoginCode(req, res) {
     attempts: 0,
   });
 
-  await transporter().sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: otpEmail,
-    subject: "Continue Render Agent login code",
-    text: `Your Continue Render Agent login code is ${code}. It expires in 10 minutes.`,
-  });
+  await sendOtpMail(code);
 
   json(res, 200, { ok: true, message: "Code sent." });
 }
@@ -2030,7 +2085,8 @@ const server = http.createServer(async (req, res) => {
         workspace,
         xaiKey: Boolean(process.env.XAI_API_KEY),
         directAgentEnabled: renderDirectAgentEnabled,
-        smtp: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
+        smtp: smtpConfigured(),
+        mailer: mailerMode(),
         repo: process.env.WORKSPACE_REPO_URL || null,
         activeRuns: activeRuns.size,
         remote: {
