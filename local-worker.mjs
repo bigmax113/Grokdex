@@ -608,6 +608,16 @@ function requiresXliffTranslation(task, inputFiles) {
 function targetLanguagesFromPrompt(text) {
   const value = String(text || "").toLowerCase();
   const matches = [
+    [/\u0444\u0440\u0430\u043d\u0446\u0443\u0437|french|fran[cç]ais/, "fr"],
+    [/\u0447\u0435\u0448|czech|cest|cs\b/, "cs"],
+    [/\u043d\u0435\u043c\u0435\u0446|german|deutsch|de\b/, "de"],
+    [/\u0430\u043d\u0433\u043b|english|en\b/, "en"],
+    [/\u0440\u0443\u0441|russian|ru\b/, "ru"],
+    [/\u0443\u043a\u0440\u0430\u0438\u043d|ukrainian|uk\b/, "uk"],
+    [/\u043f\u043e\u043b\u044c\u0441\u043a|polish|pl\b/, "pl"],
+    [/\u0440\u0443\u043c\u044b\u043d|romanian|ro\b/, "ro"],
+    [/\u0438\u0441\u043f\u0430\u043d|spanish|es\b/, "es"],
+    [/\u0438\u0442\u0430\u043b|italian|it\b/, "it"],
     [/француз|french|français|francais/, "fr"],
     [/чеш|czech|češt|cest|cs\b/, "cs"],
     [/немец|german|deutsch|de\b/, "de"],
@@ -626,18 +636,19 @@ function targetLanguagesFromPrompt(text) {
   return langs.length ? langs : [process.env.REMOTE_XLIFF_DEFAULT_TARGET_LANG || "ru"];
 }
 
-function sourceLanguageFromPrompt(text) {
+function sourceLanguageFromPrompt(text, targetLangs = []) {
   const value = String(text || "").toLowerCase();
-  if (/с\s+англий|from\s+english|en\s*[-→>]/.test(value)) return "en";
-  if (/с\s+русск|from\s+russian|ru\s*[-→>]/.test(value)) return "ru";
-  if (/с\s+немец|from\s+german|de\s*[-→>]/.test(value)) return "de";
+  if (/\u0441\s+\u0430\u043d\u0433\u043b|from\s+english|en\s*[-\u2192>]/.test(value)) return "en";
+  if (/\u0441\s+\u0440\u0443\u0441|from\s+russian|ru\s*[-\u2192>]/.test(value)) return "ru";
+  if (/\u0441\s+\u043d\u0435\u043c|from\s+german|de\s*[-\u2192>]/.test(value)) return "de";
+  if (targetLangs.includes("en") && /[\u0400-\u04ff]/.test(value)) return "ru";
   return process.env.REMOTE_XLIFF_SOURCE_LANG || "en";
 }
 
 function directXliffSupportedFiles(inputFiles) {
   return inputFiles.filter((file) => {
     const name = String(file.relativePath || file.name || "").toLowerCase();
-    return /\.(docx|pdf)$/.test(name) && !path.basename(name).startsWith("~$");
+    return /\.(docx|pdf|zip)$/.test(name) && !path.basename(name).startsWith("~$");
   });
 }
 
@@ -829,10 +840,12 @@ function directXliffRunnerScript() {
   return String.raw`
 import json
 import os
+import re
 import shutil
 import sys
 import traceback
 import types
+import zipfile
 from pathlib import Path
 
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -921,6 +934,65 @@ module.log_to_shell = log
 
 produced = []
 
+def is_supported_document(path):
+    return path.suffix.lower() in {".docx", ".pdf"} and not path.name.lower().startswith("~$")
+
+def safe_archive_extract(zip_path, destination):
+    extracted = []
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            raw_name = info.filename.replace("\\\\", "/")
+            raw_parts = raw_name.split("/")
+            parts = [part for part in raw_parts if part and part not in {".", ".."}]
+            if not parts or len(parts) != len([part for part in raw_parts if part]):
+                continue
+            target = destination.joinpath(*parts)
+            resolved = target.resolve()
+            if not str(resolved).lower().startswith(str(root).lower()):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source_stream, target.open("wb") as target_stream:
+                shutil.copyfileobj(source_stream, target_stream)
+            extracted.append(target)
+    return extracted
+
+def expand_input_files(paths):
+    expanded = []
+    extract_root = input_dir / "_direct_xliff_extracted"
+    for file_path in paths:
+        file_path = Path(file_path)
+        if is_supported_document(file_path):
+            expanded.append(file_path)
+            continue
+        if file_path.suffix.lower() == ".zip":
+            archive_root = extract_root / re.sub(r"[^A-Za-z0-9_.-]+", "_", file_path.stem or "archive")
+            log(f"Extracting archive {file_path.name} for XLIFF document translation")
+            safe_archive_extract(file_path, archive_root)
+            docs = sorted(path for path in archive_root.rglob("*") if path.is_file() and is_supported_document(path))
+            log(f"Archive {file_path.name}: found {len(docs)} supported DOCX/PDF file(s)")
+            expanded.extend(docs)
+            continue
+        log(f"Ignoring unsupported uploaded file for direct XLIFF: {file_path.name}", "WARNING")
+    return expanded
+
+def output_prefix_for(file_path):
+    try:
+        rel = Path(file_path).relative_to(input_dir)
+    except ValueError:
+        rel = Path(file_path).name
+    parent = Path(rel).parent
+    if str(parent) in {"", "."}:
+        return ""
+    parts = [part for part in parent.parts if part not in {"_direct_xliff_extracted"}]
+    if not parts:
+        return ""
+    prefix = "__".join(re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip("._") for part in parts[-4:])
+    return f"{prefix}__" if prefix else ""
+
 def copy_result(path, prefix=""):
     path = Path(path)
     if not path.exists() or not path.is_file():
@@ -937,20 +1009,24 @@ try:
         raise RuntimeError("No target languages were detected for direct XLIFF translation")
     if not files:
         raise RuntimeError("No supported DOCX/PDF files were found for direct XLIFF translation")
+    files = expand_input_files(files)
+    if not files:
+        raise RuntimeError("No DOCX/PDF files were found inside the uploaded files or archives")
 
     for target_lang in target_langs:
         log(f"Direct XLIFF translation started: {source_lang}->{target_lang}; files={len(files)}")
         for file_path in files:
             suffix = file_path.suffix.lower()
             log(f"Processing {file_path.name} via reference XLIFF pipeline")
+            prefix = output_prefix_for(file_path)
             if suffix == ".docx":
                 translated_xliff, translated_doc = module.process_docx_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
-                copy_result(translated_xliff)
-                copy_result(translated_doc)
+                copy_result(translated_xliff, prefix)
+                copy_result(translated_doc, prefix)
             elif suffix == ".pdf":
                 translated_xliff, translated_pdf = module.process_pdf_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
-                copy_result(translated_xliff)
-                copy_result(translated_pdf)
+                copy_result(translated_xliff, prefix)
+                copy_result(translated_pdf, prefix)
             else:
                 raise RuntimeError(f"Unsupported file for direct XLIFF runner: {file_path}")
 
@@ -978,8 +1054,8 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
     throw new Error("Direct XLIFF runner currently supports DOCX/PDF inputs for translation jobs");
   }
 
-  const sourceLang = sourceLanguageFromPrompt(task.prompt);
   const targetLangs = targetLanguagesFromPrompt(task.prompt);
+  const sourceLang = sourceLanguageFromPrompt(task.prompt, targetLangs);
   const scriptPath = path.join(taskDir, "direct-xliff-runner.py");
   await fsp.writeFile(scriptPath, directXliffRunnerScript(), "utf8");
 
