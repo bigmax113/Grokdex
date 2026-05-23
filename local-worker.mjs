@@ -412,12 +412,18 @@ async function lmStudioAdminJson(method, apiPath, payload) {
   return data;
 }
 
-async function unloadLoadedEmbeddingModels() {
-  if (String(process.env.REMOTE_WORKER_UNLOAD_EMBEDDINGS_AFTER || "true").toLowerCase() === "false") return 0;
+function lmStudioUnloadOnCancelEnabled() {
+  return String(process.env.REMOTE_WORKER_UNLOAD_LMSTUDIO_ON_CANCEL || "true").toLowerCase() !== "false";
+}
+
+async function unloadLoadedLmStudioModels({ includeEmbeddings = false, onlyEmbeddings = false } = {}) {
   const data = await lmStudioAdminJson("GET", "/models");
   let unloaded = 0;
   for (const model of data.models || []) {
-    if (model.type !== "embedding" && model.type !== "embeddings") continue;
+    const type = String(model.type || "").toLowerCase();
+    const isEmbedding = type === "embedding" || type === "embeddings";
+    if (onlyEmbeddings && !isEmbedding) continue;
+    if (!includeEmbeddings && isEmbedding) continue;
     for (const instance of model.loaded_instances || []) {
       if (!instance.id) continue;
       await lmStudioAdminJson("POST", "/models/unload", { instance_id: instance.id });
@@ -425,6 +431,21 @@ async function unloadLoadedEmbeddingModels() {
     }
   }
   return unloaded;
+}
+
+async function unloadLoadedEmbeddingModels() {
+  if (String(process.env.REMOTE_WORKER_UNLOAD_EMBEDDINGS_AFTER || "true").toLowerCase() === "false") return 0;
+  return unloadLoadedLmStudioModels({ includeEmbeddings: true, onlyEmbeddings: true });
+}
+
+async function hardStopLmStudioGeneration(taskId, reason) {
+  if (!lmStudioUnloadOnCancelEnabled()) return;
+  try {
+    const unloaded = await unloadLoadedLmStudioModels({ includeEmbeddings: false });
+    if (unloaded) await logRemote(taskId, `Unloaded ${unloaded} LM Studio LLM instance(s) after ${reason}`);
+  } catch (error) {
+    await logRemote(taskId, `LM Studio hard stop skipped: ${error.message}`);
+  }
 }
 
 async function remoteJson(apiPath, options = {}) {
@@ -700,6 +721,7 @@ async function runContinue(taskId, prompt, runConfig) {
       if (settled) return;
       settled = true;
       killProcessTree(child.pid);
+      void hardStopLmStudioGeneration(taskId, "timeout");
       reject(new Error(`Continue task timed out after ${Math.round(taskTimeoutMs / 1000)} seconds`));
     }, taskTimeoutMs);
     const cancelTimer = setInterval(async () => {
@@ -713,6 +735,7 @@ async function runContinue(taskId, prompt, runConfig) {
           clearInterval(cancelTimer);
           await logRemote(taskId, "Cancellation received; stopping Continue/LM Studio task");
           killProcessTree(child.pid);
+          await hardStopLmStudioGeneration(taskId, "user cancellation");
           reject(new Error("Stopped by user"));
         }
       } catch {
