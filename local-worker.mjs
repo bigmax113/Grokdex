@@ -294,7 +294,11 @@ async function prepareContinueRun(task, taskDir) {
   }
   const selectedProvider = normalizeWorkerProvider(task.model?.id || task.provider || provider);
   const config = baseContinueConfigPath(selectedProvider);
-  return { config, env: {}, label: `${selectedProvider}:${path.basename(config)}` };
+  return {
+    config,
+    env: { LMSTUDIO_API_TOKEN: process.env.LMSTUDIO_API_TOKEN || "lmstudio" },
+    label: `${selectedProvider}:${path.basename(config)}`,
+  };
 }
 
 function continueExecutable() {
@@ -307,8 +311,13 @@ function continueExecutable() {
   return "cn";
 }
 
-function psQuote(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function cmdQuote(value) {
+  return `"${String(value).replace(/"/g, "\"\"")}"`;
+}
+
+function promptArgument(prompt, runConfig) {
+  if (!runConfig.promptPath) return String(prompt || "");
+  return `Read the UTF-8 task prompt from this file and follow it exactly: ${runConfig.promptPath}`;
 }
 
 function killProcessTree(pid) {
@@ -495,24 +504,29 @@ function spawnContinue(prompt, runConfig) {
   else args.push("--verbose");
   if (mode === "readonly") args.unshift("--readonly");
   if (mode === "auto") args.unshift("--auto");
+  const invocationArgs = [...args, promptArgument(prompt, runConfig)];
+
+  const env = { ...process.env, ...runConfig.env, NO_COLOR: "1" };
 
   if (process.platform === "win32") {
-    const command = `& ${psQuote(cn)} ${args.map(psQuote).join(" ")}`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+    const command = [cn, ...invocationArgs].map(cmdQuote).join(" ");
+    const child = spawn(command, {
       cwd: projectRoot,
-      env: { ...process.env, ...runConfig.env, NO_COLOR: "1" },
+      env,
+      shell: process.env.ComSpec || true,
       windowsHide: true,
     });
-    child.stdin.end(prompt);
+    child.stdin.end();
     return { child, config, args };
   }
 
-  const child = spawn(cn, args, {
+  const child = spawn(cn, invocationArgs, {
     cwd: projectRoot,
-    env: { ...process.env, ...runConfig.env, NO_COLOR: "1" },
+    env,
     detached: true,
+    windowsHide: true,
   });
-  child.stdin.end(prompt);
+  child.stdin.end();
   return { child, config, args };
 }
 
@@ -647,6 +661,8 @@ async function processTask(task) {
 
     const prompt = buildPrompt(task, inputDir, outputDir, inputFiles);
     const runConfig = await prepareContinueRun(task, taskDir);
+    runConfig.promptPath = path.join(taskDir, "continue-prompt.md");
+    await fsp.writeFile(runConfig.promptPath, prompt, "utf8");
     const result = await runContinue(task.id, prompt, runConfig);
     transcript = result.transcript || "";
     if (result.code !== 0) throw new Error(`Continue exited with code ${result.code}`);
