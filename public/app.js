@@ -9,6 +9,7 @@ const state = {
 };
 
 let currentRunId = null;
+let currentTaskId = null;
 let controller = null;
 
 function setLoginStatus(text) {
@@ -306,6 +307,7 @@ async function readEventStream(response) {
           localStorage.setItem("remoteContinueChatId", state.chatId);
         }
         if (data.taskId) {
+          currentTaskId = data.taskId;
           setRunStatus(`Queued: ${data.taskId}`);
           setRemoteStatus(`Task ${data.taskId} queued.`);
         }
@@ -335,6 +337,7 @@ async function runAgent(event) {
   if ((!prompt && !state.attachments.length) || currentRunId) return;
   const selected = [...state.attachments];
   currentRunId = `ui-${Date.now().toString(36)}`;
+  currentTaskId = null;
   controller = new AbortController();
   $("send").disabled = true;
   $("stop").disabled = false;
@@ -377,6 +380,7 @@ async function runAgent(event) {
     appendAssistantToken(error.name === "AbortError" ? "\n[stopped]\n" : `\nERROR: ${error.message}\n`);
   } finally {
     currentRunId = null;
+    currentTaskId = null;
     controller = null;
     $("send").disabled = false;
     $("stop").disabled = true;
@@ -391,10 +395,11 @@ async function runAgent(event) {
 async function stopRun() {
   if (!currentRunId) return;
   const runId = currentRunId;
+  const taskId = currentTaskId;
   controller?.abort();
   await api("/api/stop", {
     method: "POST",
-    body: JSON.stringify({ runId }),
+    body: JSON.stringify({ runId, taskId }),
   }).catch(() => {});
 }
 

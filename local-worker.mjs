@@ -458,6 +458,10 @@ async function streamRemoteOutput(taskId, chunk) {
   }).catch(() => {});
 }
 
+async function remoteTaskStatus(taskId) {
+  return remoteJson(`/api/worker/tasks/${encodeURIComponent(taskId)}/status`);
+}
+
 async function saveInputFiles(task, inputDir) {
   await fsp.mkdir(inputDir, { recursive: true });
   const files = [];
@@ -691,12 +695,32 @@ async function runContinue(taskId, prompt, runConfig) {
   await logRemote(taskId, `Continue started with ${runConfig.label || path.basename(config)} (${args.join(" ")})`);
 
   return await new Promise((resolve, reject) => {
+    let cancelPollInFlight = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       killProcessTree(child.pid);
       reject(new Error(`Continue task timed out after ${Math.round(taskTimeoutMs / 1000)} seconds`));
     }, taskTimeoutMs);
+    const cancelTimer = setInterval(async () => {
+      if (settled || cancelPollInFlight) return;
+      cancelPollInFlight = true;
+      try {
+        const status = await remoteTaskStatus(taskId);
+        if (status.cancelRequested) {
+          settled = true;
+          clearTimeout(timer);
+          clearInterval(cancelTimer);
+          await logRemote(taskId, "Cancellation received; stopping Continue/LM Studio task");
+          killProcessTree(child.pid);
+          reject(new Error("Stopped by user"));
+        }
+      } catch {
+        // Cancellation polling is best-effort; the next poll or final task state will catch up.
+      } finally {
+        cancelPollInFlight = false;
+      }
+    }, 1500);
 
     const collect = (chunk, streamName) => {
       const text = chunk.toString("utf8");
@@ -714,12 +738,14 @@ async function runContinue(taskId, prompt, runConfig) {
     child.on("error", (error) => {
       settled = true;
       clearTimeout(timer);
+      clearInterval(cancelTimer);
       reject(error);
     });
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearInterval(cancelTimer);
       resolve({ code, transcript });
     });
   });

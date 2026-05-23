@@ -99,6 +99,7 @@ const codeTtlMs = Number(process.env.OTP_TTL_MS || 10 * 60 * 1000);
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 const activeRuns = new Map();
 const localAgentStreams = new Map();
+const localAgentRunTasks = new Map();
 const pendingCodes = new Map();
 const sessions = new Map();
 const requestBuckets = new Map();
@@ -1861,7 +1862,7 @@ async function handleWorkerNext(req, res) {
   if (!requireWorker(req, res)) return;
   const workerId = String(req.headers["x-worker-id"] || "local-worker").slice(0, 80);
   const tasks = await listRemoteTasks({ includeAll: true });
-  const task = tasks.reverse().find((item) => item.status === "queued");
+  const task = tasks.reverse().find((item) => item.status === "queued" && !item.cancelRequested);
   if (!task) {
     json(res, 200, { task: null });
     return;
@@ -1923,6 +1924,17 @@ async function handleWorkerOutput(req, res, id) {
     sse(stream.res, "token", { token: chunk });
   }
   json(res, 200, { ok: true, delivered: Boolean(stream) });
+}
+
+async function handleWorkerStatus(req, res, id) {
+  if (!requireWorker(req, res)) return;
+  const task = await readRemoteTask(id, { includeAll: true });
+  json(res, 200, {
+    id: task.id,
+    status: task.status,
+    cancelRequested: Boolean(task.cancelRequested),
+    error: task.error || null,
+  });
 }
 
 async function handleWorkerComplete(req, res, id) {
@@ -2098,13 +2110,16 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
   let logCount = 0;
   const startedAt = Date.now();
   const streamState = { res, hadOutput: false, assistantText: "" };
+  const localRunId = body.runId || task.id;
   localAgentStreams.set(task.id, streamState);
+  localAgentRunTasks.set(localRunId, task.id);
   try {
     while (!res.destroyed && !res.writableEnded) {
       if (Date.now() - startedAt > 30 * 60 * 1000) {
         sse(res, "error", { error: `Local worker task ${task.id} is still running. Check Document jobs for results.` });
         sse(res, "done", { code: 124 });
         res.end();
+        localAgentRunTasks.delete(localRunId);
         return;
       }
 
@@ -2119,6 +2134,7 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
         sse(res, "error", { error: current.error || "Local worker task failed" });
         sse(res, "done", { code: 1 });
         res.end();
+        localAgentRunTasks.delete(localRunId);
         return;
       }
 
@@ -2149,6 +2165,7 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
         if (files.length) sse(res, "result", { files });
         sse(res, "done", { code: 0 });
         res.end();
+        localAgentRunTasks.delete(localRunId);
         return;
       }
 
@@ -2278,11 +2295,41 @@ async function stopRun(req, res) {
   if (!session) return;
   const body = await readBody(req);
   const child = activeRuns.get(body.runId);
+  let stoppedLocalWorkerTask = false;
   if (child) {
     killProcessTree(child.pid);
     activeRuns.delete(body.runId);
   }
-  json(res, 200, { ok: true, stopped: Boolean(child) });
+  let taskId = localAgentRunTasks.get(body.runId);
+  if (!taskId && body.taskId) {
+    try {
+      taskId = safeRemoteId(body.taskId);
+    } catch {
+      taskId = "";
+    }
+  }
+  if (taskId) {
+    try {
+      const task = await readRemoteTask(taskId, { email: session.email });
+      if (!["done", "failed"].includes(task.status)) {
+        task.cancelRequested = true;
+        if (task.status === "queued") {
+          task.status = "failed";
+          task.error = "Stopped by user before the local worker started";
+          task.completedAt = new Date().toISOString();
+        }
+        task.logs = [
+          ...(task.logs || []),
+          { at: new Date().toISOString(), message: "Stop requested by user" },
+        ];
+        await writeRemoteTask(task);
+      }
+      stoppedLocalWorkerTask = true;
+    } catch {
+      // The task may already have finished or moved out of this storage scope.
+    }
+  }
+  json(res, 200, { ok: true, stopped: Boolean(child) || stoppedLocalWorkerTask });
 }
 
 function contentType(filePath) {
@@ -2375,7 +2422,10 @@ const server = http.createServer(async (req, res) => {
     const remoteTaskMatch = url.pathname.match(/^\/api\/remote\/tasks\/([^/]+)$/);
     if (req.method === "GET" && remoteTaskMatch) return await handleRemoteTaskGet(req, res, remoteTaskMatch[1]);
     if (req.method === "GET" && url.pathname === "/api/worker/next") return await handleWorkerNext(req, res);
-    const workerTaskMatch = url.pathname.match(/^\/api\/worker\/tasks\/([^/]+)\/(log|output|complete)$/);
+    const workerTaskMatch = url.pathname.match(/^\/api\/worker\/tasks\/([^/]+)\/(log|output|complete|status)$/);
+    if (req.method === "GET" && workerTaskMatch?.[2] === "status") {
+      return await handleWorkerStatus(req, res, workerTaskMatch[1]);
+    }
     if (req.method === "POST" && workerTaskMatch?.[2] === "log") {
       return await handleWorkerLog(req, res, workerTaskMatch[1]);
     }
