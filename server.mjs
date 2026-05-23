@@ -911,7 +911,8 @@ function readCredentialFile(filePath) {
 }
 
 function parseJsonCredential({ jsonText = "", jsonB64 = "", filePath = "" }) {
-  const raw = jsonText || (jsonB64 ? Buffer.from(jsonB64, "base64").toString("utf8") : "") || readCredentialFile(filePath);
+  const raw = (jsonText || (jsonB64 ? Buffer.from(jsonB64, "base64").toString("utf8") : "") || readCredentialFile(filePath))
+    .replace(/^\uFEFF/, "");
   if (!raw) throw new Error("Google Drive credentials are not configured");
   return JSON.parse(raw);
 }
