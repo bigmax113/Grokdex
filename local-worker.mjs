@@ -880,6 +880,22 @@ module.__file__ = str(translator_path)
 sys.modules[module.__name__] = module
 exec(compile(source, str(translator_path), "exec"), module.__dict__)
 
+def apply_pdf_runtime_overrides():
+    try:
+        import pymupdf as pymupdf_fitz
+    except Exception:
+        try:
+            import fitz as pymupdf_fitz
+        except Exception:
+            return
+    try:
+        if not hasattr(pymupdf_fitz, "open"):
+            return
+        module.fitz = pymupdf_fitz
+        module._require_fitz = lambda: None
+    except Exception:
+        pass
+
 def env_flag(name, default=False):
     value = os.environ.get(name)
     if value is None:
@@ -935,6 +951,7 @@ def apply_direct_runtime_overrides():
         module.load_forced_translation_model = keep_translation_model_ready
         module.unload_loaded_models = keep_loaded_models
 
+apply_pdf_runtime_overrides()
 apply_direct_runtime_overrides()
 
 def log(message, level="INFO"):
