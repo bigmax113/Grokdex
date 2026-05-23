@@ -96,6 +96,7 @@ const googleDriveProfileStateTtlMs = Number(process.env.GOOGLE_DRIVE_PROFILE_STA
 const codeTtlMs = Number(process.env.OTP_TTL_MS || 10 * 60 * 1000);
 const sessionTtlMs = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 const activeRuns = new Map();
+const localAgentStreams = new Map();
 const pendingCodes = new Map();
 const sessions = new Map();
 const requestBuckets = new Map();
@@ -198,12 +199,34 @@ function makeSession(email) {
   const id = crypto.randomBytes(32).toString("base64url");
   const expiresAt = Date.now() + sessionTtlMs;
   sessions.set(id, { email, expiresAt });
-  return `${id}.${sign(id)}`;
+  const payload = Buffer.from(JSON.stringify({
+    id,
+    email: normalizedEmail(email),
+    expiresAt,
+  }), "utf8").toString("base64url");
+  const signedValue = `v2.${payload}`;
+  return `${signedValue}.${sign(signedValue)}`;
 }
 
 function readSession(req) {
   const cookie = parseCookies(req).continue_session;
   if (!cookie) return null;
+  const [version, payload, payloadMac] = cookie.split(".");
+  if (version === "v2" && payload && payloadMac) {
+    const signedValue = `v2.${payload}`;
+    if (!timingEqual(payloadMac, sign(signedValue))) return null;
+    try {
+      const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+      if (!session.email || Number(session.expiresAt || 0) < Date.now()) return null;
+      return {
+        id: String(session.id || ""),
+        email: normalizedEmail(session.email),
+        expiresAt: Number(session.expiresAt),
+      };
+    } catch {
+      return null;
+    }
+  }
   const [id, mac] = cookie.split(".");
   if (!id || !mac || !timingEqual(mac, sign(id))) return null;
   const session = sessions.get(id);
@@ -1797,6 +1820,18 @@ async function handleWorkerLog(req, res, id) {
   json(res, 200, { ok: true });
 }
 
+async function handleWorkerOutput(req, res, id) {
+  if (!requireWorker(req, res)) return;
+  const body = await readBody(req);
+  const chunk = String(body.chunk || "");
+  const stream = localAgentStreams.get(id);
+  if (chunk && stream && !stream.res.destroyed && !stream.res.writableEnded) {
+    stream.hadOutput = true;
+    sse(stream.res, "token", { token: chunk });
+  }
+  json(res, 200, { ok: true, delivered: Boolean(stream) });
+}
+
 async function handleWorkerComplete(req, res, id) {
   if (!requireWorker(req, res)) return;
   const body = await readBody(req);
@@ -1961,46 +1996,48 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
 
   let logCount = 0;
   const startedAt = Date.now();
-  while (!res.destroyed && !res.writableEnded) {
-    if (Date.now() - startedAt > 30 * 60 * 1000) {
-      sse(res, "error", { error: `Local worker task ${task.id} is still running. Check Document jobs for results.` });
-      sse(res, "done", { code: 124 });
-      res.end();
-      return;
-    }
-
-    const current = await readRemoteTask(task.id, { email: session.email });
-    const logs = Array.isArray(current.logs) ? current.logs : [];
-    for (const log of logs.slice(logCount)) {
-      sse(res, "token", { token: `\n[${current.status}] ${log.message}\n` });
-    }
-    logCount = logs.length;
-
-    if (current.status === "failed") {
-      sse(res, "error", { error: current.error || "Local worker task failed" });
-      sse(res, "done", { code: 1 });
-      res.end();
-      return;
-    }
-
-    if (current.status === "done") {
-      const transcript = (current.resultFiles || []).find((file) => file.name === "transcript.txt");
-      if (transcript) {
-        const text = (await readRemoteBlob(current.id, transcript)).toString("utf8").trim();
-        const limit = 30000;
-        const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
-        if (displayed) sse(res, "token", { token: `\n${displayed}\n` });
+  const streamState = { res, hadOutput: false };
+  localAgentStreams.set(task.id, streamState);
+  try {
+    while (!res.destroyed && !res.writableEnded) {
+      if (Date.now() - startedAt > 30 * 60 * 1000) {
+        sse(res, "error", { error: `Local worker task ${task.id} is still running. Check Document jobs for results.` });
+        sse(res, "done", { code: 124 });
+        res.end();
+        return;
       }
-      const resultLinks = (current.resultFiles || [])
-        .map((file) => `- ${file.name}: ${publicUrl(req, file.downloadUrl || `/api/remote/tasks/${encodeURIComponent(current.id)}/download?file=${encodeURIComponent(file.id)}`)}`)
-        .join("\n");
-      if (resultLinks) sse(res, "token", { token: `\nResults:\n${resultLinks}\n` });
-      sse(res, "done", { code: 0 });
-      res.end();
-      return;
-    }
 
-    await sleep(3000);
+      const current = await readRemoteTask(task.id, { email: session.email });
+      const logs = Array.isArray(current.logs) ? current.logs : [];
+      for (const log of logs.slice(logCount)) {
+        sse(res, "log", { status: current.status, message: log.message });
+      }
+      logCount = logs.length;
+
+      if (current.status === "failed") {
+        sse(res, "error", { error: current.error || "Local worker task failed" });
+        sse(res, "done", { code: 1 });
+        res.end();
+        return;
+      }
+
+      if (current.status === "done") {
+        const transcript = (current.resultFiles || []).find((file) => file.name === "transcript.txt");
+        if (transcript && !streamState.hadOutput) {
+          const text = (await readRemoteBlob(current.id, transcript)).toString("utf8").trim();
+          const limit = 30000;
+          const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
+          if (displayed) sse(res, "token", { token: `\n${displayed}\n` });
+        }
+        sse(res, "done", { code: 0 });
+        res.end();
+        return;
+      }
+
+      await sleep(600);
+    }
+  } finally {
+    localAgentStreams.delete(task.id);
   }
 }
 
@@ -2203,9 +2240,12 @@ const server = http.createServer(async (req, res) => {
     const remoteTaskMatch = url.pathname.match(/^\/api\/remote\/tasks\/([^/]+)$/);
     if (req.method === "GET" && remoteTaskMatch) return await handleRemoteTaskGet(req, res, remoteTaskMatch[1]);
     if (req.method === "GET" && url.pathname === "/api/worker/next") return await handleWorkerNext(req, res);
-    const workerTaskMatch = url.pathname.match(/^\/api\/worker\/tasks\/([^/]+)\/(log|complete)$/);
+    const workerTaskMatch = url.pathname.match(/^\/api\/worker\/tasks\/([^/]+)\/(log|output|complete)$/);
     if (req.method === "POST" && workerTaskMatch?.[2] === "log") {
       return await handleWorkerLog(req, res, workerTaskMatch[1]);
+    }
+    if (req.method === "POST" && workerTaskMatch?.[2] === "output") {
+      return await handleWorkerOutput(req, res, workerTaskMatch[1]);
     }
     if (req.method === "POST" && workerTaskMatch?.[2] === "complete") {
       return await handleWorkerComplete(req, res, workerTaskMatch[1]);

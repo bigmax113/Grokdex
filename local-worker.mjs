@@ -425,6 +425,14 @@ async function logRemote(taskId, message) {
   }).catch((error) => console.warn(`[${taskId}] remote log failed: ${error.message}`));
 }
 
+async function streamRemoteOutput(taskId, chunk) {
+  if (!chunk) return;
+  await remoteJson(`/api/worker/tasks/${encodeURIComponent(taskId)}/output`, {
+    method: "POST",
+    body: JSON.stringify({ chunk }),
+  }).catch(() => {});
+}
+
 async function saveInputFiles(task, inputDir) {
   await fsp.mkdir(inputDir, { recursive: true });
   const files = [];
@@ -550,8 +558,9 @@ async function runContinue(taskId, prompt, runConfig) {
     const collect = (chunk, streamName) => {
       const text = chunk.toString("utf8");
       transcript += text;
+      if (streamName === "stdout") streamRemoteOutput(taskId, text);
       const now = Date.now();
-      if (now - lastLogAt > 30000) {
+      if (streamName !== "stdout" && now - lastLogAt > 30000) {
         lastLogAt = now;
         logRemote(taskId, `${streamName}: ${Buffer.byteLength(text)} bytes; total transcript ${Buffer.byteLength(transcript)} bytes`);
       }

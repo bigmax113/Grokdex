@@ -110,9 +110,10 @@ async function readEventStream(response) {
       const raw = frame.match(/^data: (.+)$/m)?.[1] || "{}";
       const data = JSON.parse(raw);
       if (event === "token" || event === "stderr") append(data.token || "");
-      if (event === "meta") append(`\n[${data.stage}] ${data.mode || ""}\n`);
+      if (event === "meta" && data.taskId) setRemoteStatus(`Task ${data.taskId} queued.`);
+      if (event === "log") setRemoteStatus(data.message || "");
       if (event === "error") append(`\nERROR: ${data.error}\n`);
-      if (event === "done") append(`\n[exit ${data.code}]\n`);
+      if (event === "done") setRemoteStatus(data.code === 0 ? "Done." : `Exit ${data.code}`);
     }
   }
 }
@@ -126,6 +127,7 @@ async function runAgent(event) {
   $("send").disabled = true;
   $("stop").disabled = false;
   append(`\n> ${prompt}\n`);
+  $("prompt").value = "";
   try {
     const response = await fetch("/api/agent", {
       method: "POST",
@@ -140,6 +142,7 @@ async function runAgent(event) {
     });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
+      if (response.status === 401) await refreshMe().catch(() => {});
       throw new Error(data.error || response.statusText);
     }
     await readEventStream(response);
@@ -151,6 +154,8 @@ async function runAgent(event) {
     $("send").disabled = false;
     $("stop").disabled = true;
     await refreshStatus().catch(() => {});
+    await refreshRemoteTasks().catch(() => {});
+    $("prompt").focus();
   }
 }
 
