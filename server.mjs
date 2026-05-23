@@ -930,11 +930,50 @@ function parseGoogleOAuthClient() {
 }
 
 function parseGoogleOAuthToken() {
-  return parseJsonCredential({
+  return normalizeGoogleOAuthToken(parseJsonCredential({
     jsonText: googleDriveOAuthTokenJson,
     jsonB64: googleDriveOAuthTokenJsonB64,
     filePath: googleDriveOAuthTokenFile,
-  });
+  }));
+}
+
+function normalizeGoogleOAuthToken(token) {
+  const normalized = { ...token };
+  if (!normalized.access_token && normalized.token) normalized.access_token = normalized.token;
+  if (!normalized.expiry_date && normalized.expiry) {
+    const expiryDate = Date.parse(normalized.expiry);
+    if (Number.isFinite(expiryDate)) normalized.expiry_date = expiryDate;
+  }
+  if (!normalized.scope && Array.isArray(normalized.scopes)) normalized.scope = normalized.scopes.join(" ");
+  return normalized;
+}
+
+function isDriveAuthError(error) {
+  const status = error?.code || error?.status || error?.response?.status;
+  const data = error?.response?.data;
+  const text = [
+    error?.message,
+    typeof data === "string" ? data : "",
+    data?.error,
+    data?.error_description,
+  ].filter(Boolean).join(" ");
+  return status === 401 || /invalid_grant|invalid_credentials|unauthorized_client/i.test(text);
+}
+
+function fsStorage(ownerEmail = "", folderName = "Local Render filesystem") {
+  return {
+    kind: "fs",
+    mode: "local",
+    rootId: "",
+    profile: null,
+    ownerEmail: normalizedEmail(ownerEmail),
+    folderName,
+  };
+}
+
+function warnStorageSkip(storage, error) {
+  const message = error?.message || String(error);
+  console.warn(`Skipping ${storage.mode || storage.kind} storage: ${message}`);
 }
 
 async function googleDrive(profile = null) {
@@ -949,7 +988,7 @@ async function googleDrive(profile = null) {
       client.client_secret,
       Array.isArray(client.redirect_uris) ? client.redirect_uris[0] : undefined,
     );
-    authClient.setCredentials(JSON.parse(decryptSecret(profile.tokenCipher)));
+    authClient.setCredentials(normalizeGoogleOAuthToken(JSON.parse(decryptSecret(profile.tokenCipher))));
     const drive = google.drive({ version: "v3", auth: authClient });
     driveClients.set(key, drive);
     return drive;
@@ -1243,18 +1282,25 @@ async function ownerStorage(email) {
       folderName: "Default test Drive",
     };
   }
-  return {
-    kind: "fs",
-    mode: "local",
-    rootId: "",
-    profile: null,
-    ownerEmail: normalizedEmail(email),
-    folderName: "Local Render filesystem",
-  };
+  return fsStorage(email);
+}
+
+async function writableOwnerStorage(email) {
+  const storage = await ownerStorage(email);
+  if (storage.kind !== "drive" || storage.mode === "personal") return storage;
+  try {
+    await driveFindChild(storage.rootId, "__continue_render_agent_probe__", "", storage.profile);
+    return storage;
+  } catch (error) {
+    if (!isDriveAuthError(error)) throw error;
+    warnStorageSkip(storage, error);
+    return fsStorage(email, "Local Render filesystem (default Drive needs reconnect)");
+  }
 }
 
 async function taskStorage(task) {
   const ownerEmail = task.storage?.ownerEmail || task.ownerEmail || "";
+  if (task.storage?.mode === "local") return fsStorage(ownerEmail);
   if (task.storage?.mode === "personal") {
     const profile = await getDriveProfile(ownerEmail);
     if (!profile?.folderId || !profile?.tokenCipher) throw new Error(`Drive profile not found for ${ownerEmail}`);
@@ -1275,13 +1321,7 @@ async function taskStorage(task) {
       ownerEmail: normalizedEmail(ownerEmail),
     };
   }
-  return {
-    kind: "fs",
-    mode: "local",
-    rootId: "",
-    profile: null,
-    ownerEmail: normalizedEmail(ownerEmail),
-  };
+  return fsStorage(ownerEmail);
 }
 
 async function storageCandidates({ email = "", includeAll = false } = {}) {
@@ -1290,9 +1330,8 @@ async function storageCandidates({ email = "", includeAll = false } = {}) {
     const candidates = [];
     if (useDriveStorage()) {
       candidates.push({ kind: "drive", mode: "default", rootId: googleDriveFolderId, profile: null, ownerEmail: "" });
-    } else {
-      candidates.push({ kind: "fs", mode: "local", rootId: "", profile: null, ownerEmail: "" });
     }
+    candidates.push(fsStorage(""));
     for (const profile of connectedDriveProfiles()) {
       candidates.push({
         kind: "drive",
@@ -1312,8 +1351,13 @@ async function storageCandidates({ email = "", includeAll = false } = {}) {
   }
   if (!ownerResourceFallbackEnabled) return [];
   if (profile?.defaultDriveDisabledAt) return [];
-  if (useDriveStorage()) return [{ kind: "drive", mode: "default", rootId: googleDriveFolderId, profile: null, ownerEmail: target }];
-  return [{ kind: "fs", mode: "local", rootId: "", profile: null, ownerEmail: target }];
+  if (useDriveStorage()) {
+    return [
+      { kind: "drive", mode: "default", rootId: googleDriveFolderId, profile: null, ownerEmail: target },
+      fsStorage(target),
+    ];
+  }
+  return [fsStorage(target)];
 }
 
 async function readRemoteTaskFromStorage(id, storage) {
@@ -1463,11 +1507,16 @@ async function listRemoteTasksFromStorage(storage) {
 async function listRemoteTasks(options = {}) {
   const tasksById = new Map();
   for (const storage of await storageCandidates(options)) {
-    for (const task of await listRemoteTasksFromStorage(storage)) {
-      if (options.email && normalizedEmail(task.storage?.ownerEmail || task.ownerEmail) !== normalizedEmail(options.email)) {
-        continue;
+    try {
+      for (const task of await listRemoteTasksFromStorage(storage)) {
+        if (options.email && normalizedEmail(task.storage?.ownerEmail || task.ownerEmail) !== normalizedEmail(options.email)) {
+          continue;
+        }
+        tasksById.set(task.id, task);
       }
-      tasksById.set(task.id, task);
+    } catch (error) {
+      if (!isDriveAuthError(error)) throw error;
+      warnStorageSkip(storage, error);
     }
   }
   return [...tasksById.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
@@ -1519,7 +1568,7 @@ async function handleRemoteTaskCreate(req, res) {
   const xliffTranslationRequired = hasTranslationIntent(prompt)
     && (!uploads.length || uploads.some(uploadLooksLikeDocument));
   const id = remoteTaskId();
-  const selectedStorage = await ownerStorage(session.email);
+  const selectedStorage = await writableOwnerStorage(session.email);
   const llmProfile = remoteAllowPersonalLlm ? await getLlmProfile(session.email) : null;
   const storage = selectedStorage.mode === "personal"
     ? {
@@ -1528,7 +1577,14 @@ async function handleRemoteTaskCreate(req, res) {
       folderId: selectedStorage.rootId,
       folderName: selectedStorage.folderName,
     }
-    : {
+    : selectedStorage.mode === "local"
+      ? {
+        mode: "local",
+        ownerEmail: normalizedEmail(session.email),
+        folderId: null,
+        folderName: selectedStorage.folderName,
+      }
+      : {
       mode: selectedStorage.mode,
       ownerEmail: normalizedEmail(session.email),
       folderId: selectedStorage.rootId || null,
