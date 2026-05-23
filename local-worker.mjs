@@ -1400,6 +1400,26 @@ async function collectResultFiles(dir, { onlyArchive = false } = {}) {
   })));
 }
 
+function directXliffUploadResult(file) {
+  const relativePath = String(file.relativePath || file.name || "").replace(/\\/g, "/");
+  const lower = relativePath.toLowerCase();
+  if (relativePath === "results.zip") return true;
+  if (relativePath === "result.md") return false;
+  if (lower.startsWith("_xliff/")) return false;
+  if (lower.endsWith(".xliff")) return false;
+  return true;
+}
+
+async function collectDirectXliffResultFiles(outputDir) {
+  const files = (await listResultFiles(outputDir)).filter(directXliffUploadResult);
+  return await Promise.all(files.map(async (file) => ({
+    name: file.name,
+    relativePath: file.relativePath,
+    mime: file.mime,
+    base64: (await fsp.readFile(file.path)).toString("base64"),
+  })));
+}
+
 async function packageOutputArchive(outputDir, { excludeRawOpenXmlParts = false } = {}) {
   if (!packageResults) return false;
   const files = (await listResultFiles(outputDir))
@@ -1441,8 +1461,8 @@ async function processTask(task) {
       transcript = "";
       let outputFiles = await listResultFiles(outputDir);
       if (!outputFiles.length) throw new Error("Direct XLIFF runner finished without creating files");
-      const archived = await packageOutputArchive(outputDir);
-      const files = await collectResultFiles(outputDir, { onlyArchive: archived });
+      await packageOutputArchive(outputDir);
+      const files = await collectDirectXliffResultFiles(outputDir);
       await completeTask(task.id, { status: "done", transcript, files });
       await logRemote(task.id, `Completed direct XLIFF translation with ${files.length} result file(s)`);
       return;

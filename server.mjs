@@ -112,6 +112,7 @@ let driveClient = null;
 const driveClients = new Map();
 const driveFolderCache = new Map();
 const driveConnectStates = new Map();
+const remoteTaskMutationQueues = new Map();
 
 function json(res, status, payload, headers = {}) {
   const body = JSON.stringify(payload);
@@ -127,6 +128,21 @@ function sse(res, event, payload) {
   if (res.destroyed || res.writableEnded) return;
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+async function withRemoteTaskMutation(id, mutate) {
+  const key = safeRemoteId(id);
+  const previous = remoteTaskMutationQueues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(mutate);
+  const queued = current.catch(() => {});
+  remoteTaskMutationQueues.set(key, queued);
+  try {
+    return await current;
+  } finally {
+    if (remoteTaskMutationQueues.get(key) === queued) {
+      remoteTaskMutationQueues.delete(key);
+    }
+  }
 }
 
 async function readBody(req) {
@@ -1904,11 +1920,13 @@ async function handleWorkerNext(req, res) {
 async function handleWorkerLog(req, res, id) {
   if (!requireWorker(req, res)) return;
   const body = await readBody(req);
-  const task = await readRemoteTask(id, { includeAll: true });
   const message = String(body.message || "").trim().slice(0, 4000);
   if (message) {
-    task.logs = [...(task.logs || []), { at: new Date().toISOString(), message }];
-    await writeRemoteTask(task);
+    await withRemoteTaskMutation(id, async () => {
+      const task = await readRemoteTask(id, { includeAll: true });
+      task.logs = [...(task.logs || []), { at: new Date().toISOString(), message }];
+      await writeRemoteTask(task);
+    });
   }
   json(res, 200, { ok: true });
 }
@@ -1940,51 +1958,53 @@ async function handleWorkerStatus(req, res, id) {
 async function handleWorkerComplete(req, res, id) {
   if (!requireWorker(req, res)) return;
   const body = await readBody(req);
-  const task = await readRemoteTask(id, { includeAll: true });
+  const publicTask = await withRemoteTaskMutation(id, async () => {
+    const task = await readRemoteTask(id, { includeAll: true });
+    const resultFiles = [];
+    let totalBytes = 0;
+    if (body.transcript) {
+      const transcript = Buffer.from(String(body.transcript), "utf8");
+      const fileId = `out-transcript-${crypto.randomBytes(4).toString("hex")}`;
+      const storageName = `${fileId}-transcript.txt`;
+      const stored = await saveRemoteBlobForTask(task, "outputs", storageName, "text/plain; charset=utf-8", transcript);
+      resultFiles.push({
+        id: fileId,
+        name: "transcript.txt",
+        mime: "text/plain; charset=utf-8",
+        size: transcript.length,
+        ...stored,
+      });
+      totalBytes += transcript.length;
+    }
 
-  const resultFiles = [];
-  let totalBytes = 0;
-  if (body.transcript) {
-    const transcript = Buffer.from(String(body.transcript), "utf8");
-    const fileId = `out-transcript-${crypto.randomBytes(4).toString("hex")}`;
-    const storageName = `${fileId}-transcript.txt`;
-    const stored = await saveRemoteBlobForTask(task, "outputs", storageName, "text/plain; charset=utf-8", transcript);
-    resultFiles.push({
-      id: fileId,
-      name: "transcript.txt",
-      mime: "text/plain; charset=utf-8",
-      size: transcript.length,
-      ...stored,
-    });
-    totalBytes += transcript.length;
-  }
+    for (const [index, upload] of (Array.isArray(body.files) ? body.files : []).entries()) {
+      const decoded = decodeUploadFile(upload, totalBytes);
+      totalBytes += decoded.buffer.length;
+      const fileId = `out-${index + 1}-${crypto.randomBytes(4).toString("hex")}`;
+      const storageName = `${fileId}-${decoded.name}`;
+      const stored = await saveRemoteBlobForTask(task, "outputs", storageName, decoded.mime, decoded.buffer);
+      resultFiles.push({
+        id: fileId,
+        name: decoded.name,
+        relativePath: decoded.relativePath,
+        mime: decoded.mime,
+        size: decoded.buffer.length,
+        ...stored,
+      });
+    }
 
-  for (const [index, upload] of (Array.isArray(body.files) ? body.files : []).entries()) {
-    const decoded = decodeUploadFile(upload, totalBytes);
-    totalBytes += decoded.buffer.length;
-    const fileId = `out-${index + 1}-${crypto.randomBytes(4).toString("hex")}`;
-    const storageName = `${fileId}-${decoded.name}`;
-    const stored = await saveRemoteBlobForTask(task, "outputs", storageName, decoded.mime, decoded.buffer);
-    resultFiles.push({
-      id: fileId,
-      name: decoded.name,
-      relativePath: decoded.relativePath,
-      mime: decoded.mime,
-      size: decoded.buffer.length,
-      ...stored,
-    });
-  }
-
-  task.status = body.status === "failed" ? "failed" : "done";
-  task.error = task.status === "failed" ? String(body.error || "Worker failed").slice(0, 4000) : null;
-  task.completedAt = new Date().toISOString();
-  task.resultFiles = resultFiles;
-  task.logs = [
-    ...(task.logs || []),
-    { at: task.completedAt, message: task.status === "done" ? "Task completed" : `Task failed: ${task.error}` },
-  ];
-  await writeRemoteTask(task);
-  json(res, 200, { ok: true, task: publicRemoteTask(task) });
+    task.status = body.status === "failed" ? "failed" : "done";
+    task.error = task.status === "failed" ? String(body.error || "Worker failed").slice(0, 4000) : null;
+    task.completedAt = new Date().toISOString();
+    task.resultFiles = resultFiles;
+    task.logs = [
+      ...(task.logs || []),
+      { at: task.completedAt, message: task.status === "done" ? "Task completed" : `Task failed: ${task.error}` },
+    ];
+    await writeRemoteTask(task);
+    return publicRemoteTask(task);
+  });
+  json(res, 200, { ok: true, task: publicTask });
 }
 
 function runCapture(command, args, { timeoutMs = 15000 } = {}) {
