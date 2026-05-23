@@ -2139,8 +2139,14 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
       }
 
       if (current.status === "done") {
+        const resultFiles = current.resultFiles || [];
+        const downloadableFiles = resultFiles.filter((file) => file.name !== "transcript.txt");
         const transcript = (current.resultFiles || []).find((file) => file.name === "transcript.txt");
-        if (transcript && !streamState.hadOutput) {
+        const preferDownloadOnly = Boolean(current.pipeline?.xliffTranslationRequired);
+        if (preferDownloadOnly && downloadableFiles.length && !streamState.hadOutput) {
+          assistantText += "\nГотово. Результаты доступны по ссылкам для скачивания.\n";
+          sse(res, "token", { token: "\nГотово. Результаты доступны по ссылкам для скачивания.\n" });
+        } else if (transcript && !streamState.hadOutput) {
           const text = (await readRemoteBlob(current.id, transcript)).toString("utf8").trim();
           const limit = 30000;
           const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
@@ -2155,7 +2161,7 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
             sse(res, "error", { error: `Chat save failed: ${error.message}` });
           });
         }
-        const files = (current.resultFiles || []).map((file) => ({
+        const files = resultFiles.map((file) => ({
           id: file.id,
           name: file.name,
           mime: file.mime,

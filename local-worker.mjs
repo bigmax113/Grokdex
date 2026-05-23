@@ -862,6 +862,53 @@ module.__file__ = str(translator_path)
 sys.modules[module.__name__] = module
 exec(compile(source, str(translator_path), "exec"), module.__dict__)
 
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+def apply_direct_runtime_overrides():
+    embedding_enabled = env_flag("LM_EMBEDDING_MEMORY_ENABLED", False)
+    embedding_cache_enabled = env_flag("LM_EMBEDDING_CACHE_ENABLED", False)
+    try:
+        module.EMBEDDING_MEMORY_ENABLED = embedding_enabled
+        module.EMBEDDING_CACHE_ENABLED = embedding_cache_enabled
+        module._RUNTIME_EMBEDDING_MEMORY_ENABLED = embedding_enabled
+        module.use_embedding_memory = lambda: embedding_enabled
+    except Exception:
+        pass
+
+    original_sync = getattr(module, "sync_runtime_options_from_gui", None)
+    if callable(original_sync):
+        def sync_runtime_options_from_env():
+            original_sync()
+            try:
+                module.EMBEDDING_MEMORY_ENABLED = embedding_enabled
+                module.EMBEDDING_CACHE_ENABLED = embedding_cache_enabled
+                module._RUNTIME_EMBEDDING_MEMORY_ENABLED = embedding_enabled
+                module.use_embedding_memory = lambda: embedding_enabled
+            except Exception:
+                pass
+        module.sync_runtime_options_from_gui = sync_runtime_options_from_env
+
+    if env_flag("REMOTE_XLIFF_AVOID_FORCE_MODEL_RELOAD", True):
+        def keep_translation_model_ready(reason=""):
+            model_name = module.active_translation_model()
+            module._ACTIVE_MODEL_ID = ""
+            module._ACTIVE_TRANSLATION_MODEL_NAME = model_name
+            module._FORCED_MODEL_READY = True
+            return model_name
+
+        def keep_loaded_models(reason=""):
+            return []
+
+        module.reload_forced_translation_model = keep_translation_model_ready
+        module.load_forced_translation_model = keep_translation_model_ready
+        module.unload_loaded_models = keep_loaded_models
+
+apply_direct_runtime_overrides()
+
 def log(message, level="INFO"):
     safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8", errors="replace")
     print(f"[{level}] {safe_message}", flush=True)
@@ -939,17 +986,19 @@ async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outp
   const env = {
     ...process.env,
     ...xliffTranslatorEnv(),
-    LM_STUDIO_API_URL: process.env.LM_STUDIO_API_URL || "http://localhost:1234/v1/chat/completions",
+    LM_STUDIO_API_URL: process.env.REMOTE_XLIFF_LM_STUDIO_API_URL || `${lmStudioSwitchBase}/chat/completions`,
     LM_STUDIO_API_TOKEN: process.env.LMSTUDIO_API_TOKEN || process.env.LM_STUDIO_API_TOKEN || "lmstudio",
     LM_STUDIO_FULL_RESTART: process.env.LM_STUDIO_FULL_RESTART || "0",
     LM_STUDIO_STOP_AFTER_SESSION: process.env.LM_STUDIO_STOP_AFTER_SESSION || "0",
     LM_MODEL_CLEAN_START_DELAY_SECONDS: process.env.LM_MODEL_CLEAN_START_DELAY_SECONDS || "0",
+    REMOTE_XLIFF_AVOID_FORCE_MODEL_RELOAD: process.env.REMOTE_XLIFF_AVOID_FORCE_MODEL_RELOAD || "1",
     TMX_GOOGLE_DRIVE_ENABLED: process.env.REMOTE_XLIFF_TMX_GOOGLE_DRIVE_ENABLED || "0",
     TMX_FOLDER: process.env.REMOTE_XLIFF_TMX_FOLDER || "",
     TMX_APPLY_EXACT_MATCHES: process.env.REMOTE_XLIFF_TMX_APPLY_EXACT_MATCHES || "0",
     LM_EMBEDDING_MEMORY_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_MEMORY_ENABLED || "0",
     LM_EMBEDDING_CACHE_ENABLED: process.env.REMOTE_XLIFF_EMBEDDING_CACHE_ENABLED || "0",
     LM_EMBEDDING_MAX_TMX_REFERENCES: process.env.REMOTE_XLIFF_EMBEDDING_MAX_TMX_REFERENCES || "0",
+    XLIFF_SMART_TAG_REPAIR_CLEAN_LOCAL_SESSION: process.env.REMOTE_XLIFF_SMART_TAG_REPAIR_CLEAN_LOCAL_SESSION || "0",
     PYTHONUTF8: "1",
     PYTHONIOENCODING: "utf-8",
     NO_COLOR: "1",
@@ -1207,7 +1256,7 @@ async function processTask(task) {
 
     if (directXliffTranslation && requiresXliffTranslation(task, inputFiles)) {
       const result = await runDirectXliffTranslation(task.id, task, inputFiles, taskDir, outputDir);
-      transcript = result.transcript || "";
+      transcript = "";
       let outputFiles = await listResultFiles(outputDir);
       if (!outputFiles.length) throw new Error("Direct XLIFF runner finished without creating files");
       const archived = await packageOutputArchive(outputDir);
