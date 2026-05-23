@@ -1,4 +1,13 @@
 const $ = (id) => document.getElementById(id);
+
+const state = {
+  chats: [],
+  chatId: localStorage.getItem("remoteContinueChatId") || null,
+  messages: [],
+  attachments: [],
+  currentAssistantId: null,
+};
+
 let currentRunId = null;
 let controller = null;
 
@@ -36,12 +45,6 @@ function showDownloadLinks(files) {
   $("downloadBar").classList.remove("hidden");
 }
 
-function append(text) {
-  const output = $("output");
-  output.textContent += text;
-  output.scrollTop = output.scrollHeight;
-}
-
 function formatBytes(bytes) {
   const value = Number(bytes || 0);
   if (value < 1024) return `${value} B`;
@@ -57,6 +60,22 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function titleFromText(text) {
+  const value = String(text || "New chat").replace(/\s+/g, " ").trim();
+  return value.length > 64 ? `${value.slice(0, 64)}...` : value || "New chat";
+}
+
+function messageTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleString([], { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function activeChatTitle() {
+  const chat = state.chats.find((item) => item.id === state.chatId);
+  const firstUser = state.messages.find((item) => item.role === "user");
+  return chat?.title || titleFromText(firstUser?.content);
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "content-type": "application/json", ...(options.headers || {}) },
@@ -67,6 +86,142 @@ async function api(path, options = {}) {
   return data;
 }
 
+function renderMessages() {
+  const output = $("output");
+  const hint = $("dropHint");
+  output.textContent = "";
+  output.appendChild(hint);
+  for (const message of state.messages.filter((item) => item.role !== "system")) {
+    const article = document.createElement("article");
+    article.className = `message ${message.role}`;
+    article.dataset.id = message.id || "";
+    const meta = document.createElement("div");
+    meta.className = "messageMeta";
+    meta.textContent = `${message.role === "user" ? "You" : "Agent"}${message.createdAt ? ` - ${messageTime(message.createdAt)}` : ""}`;
+    const body = document.createElement("div");
+    body.className = "messageBody";
+    body.textContent = message.content || "";
+    article.append(meta, body);
+    output.appendChild(article);
+  }
+  output.scrollTop = output.scrollHeight;
+  $("chatTitle").value = activeChatTitle();
+}
+
+function appendMessage(role, content, { id = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` } = {}) {
+  const message = {
+    id,
+    role,
+    content,
+    createdAt: new Date().toISOString(),
+  };
+  state.messages.push(message);
+  renderMessages();
+  return message;
+}
+
+function appendAssistantToken(token) {
+  if (!state.currentAssistantId) {
+    const message = appendMessage("assistant", "", { id: `assistant-${Date.now().toString(36)}` });
+    state.currentAssistantId = message.id;
+  }
+  const message = state.messages.find((item) => item.id === state.currentAssistantId);
+  if (!message) return;
+  message.content += token;
+  renderMessages();
+}
+
+function renderChats() {
+  const list = $("chatList");
+  list.textContent = "";
+  for (const chat of state.chats) {
+    const row = document.createElement("div");
+    row.className = `chatRow ${chat.id === state.chatId ? "active" : ""}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chatItem";
+    button.onclick = () => loadChat(chat.id);
+    const name = document.createElement("div");
+    name.className = "chatName";
+    name.textContent = chat.title || "New chat";
+    name.title = name.textContent;
+    const meta = document.createElement("div");
+    meta.className = "chatMeta";
+    meta.textContent = `${messageTime(chat.updatedAt)} - ${chat.messageCount || 0} msg`;
+    button.append(name, meta);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "chatDelete";
+    remove.textContent = "Del";
+    remove.onclick = async (event) => {
+      event.stopPropagation();
+      if (currentRunId) return;
+      await api(`/api/chats/${encodeURIComponent(chat.id)}`, { method: "DELETE" });
+      if (state.chatId === chat.id) newChat();
+      await refreshChats();
+    };
+    row.append(button, remove);
+    list.appendChild(row);
+  }
+}
+
+async function refreshChats() {
+  const data = await api("/api/chats");
+  state.chats = data.chats || [];
+  renderChats();
+}
+
+async function loadChat(id) {
+  const data = await api(`/api/chats/${encodeURIComponent(id)}`);
+  state.chatId = data.chat.id;
+  localStorage.setItem("remoteContinueChatId", state.chatId);
+  state.messages = (data.chat.messages || []).map((message) => ({ ...message, id: `loaded-${Math.random().toString(36).slice(2)}` }));
+  state.currentAssistantId = null;
+  renderMessages();
+  renderChats();
+}
+
+function newChat() {
+  state.chatId = null;
+  localStorage.removeItem("remoteContinueChatId");
+  state.messages = [];
+  state.currentAssistantId = null;
+  clearDownloadLinks();
+  renderMessages();
+  renderChats();
+}
+
+function renderAttachments() {
+  const bar = $("attachmentBar");
+  bar.textContent = "";
+  bar.classList.toggle("hidden", !state.attachments.length);
+  state.attachments.forEach((file, index) => {
+    const chip = document.createElement("div");
+    chip.className = "attachmentChip";
+    const label = document.createElement("span");
+    label.textContent = `${file.webkitRelativePath || file.name} (${formatBytes(file.size)})`;
+    label.title = label.textContent;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "x";
+    remove.onclick = () => {
+      state.attachments.splice(index, 1);
+      renderAttachments();
+    };
+    chip.append(label, remove);
+    bar.appendChild(chip);
+  });
+}
+
+function addAttachments(files) {
+  for (const file of Array.from(files || [])) {
+    const key = `${file.webkitRelativePath || file.name}:${file.size}:${file.lastModified}`;
+    const exists = state.attachments.some((item) => `${item.webkitRelativePath || item.name}:${item.size}:${item.lastModified}` === key);
+    if (!exists) state.attachments.push(file);
+  }
+  renderAttachments();
+}
+
 async function refreshMe() {
   const me = await api("/api/me");
   $("email").value = me.otpEmail || "";
@@ -74,6 +229,12 @@ async function refreshMe() {
   $("app").classList.toggle("hidden", !me.authenticated);
   if (me.authenticated) {
     await refreshStatus();
+    await refreshChats().catch((error) => setRemoteStatus(error.message));
+    if (state.chatId && state.chats.some((chat) => chat.id === state.chatId)) {
+      await loadChat(state.chatId).catch(() => newChat());
+    } else {
+      newChat();
+    }
     await refreshDriveProfile().catch((error) => setRemoteStatus(error.message));
     await refreshRemoteTasks().catch((error) => setRemoteStatus(error.message));
   }
@@ -116,7 +277,7 @@ async function verifyCode() {
 
 async function logout() {
   await api("/api/auth/logout", { method: "POST", body: "{}" });
-  $("output").textContent = "";
+  newChat();
   $("remoteTasks").innerHTML = "";
   await refreshMe();
 }
@@ -137,11 +298,17 @@ async function readEventStream(response) {
       const data = JSON.parse(raw);
       if (event === "token" || event === "stderr") {
         setRunStatus("Receiving model output...");
-        append(data.token || "");
+        appendAssistantToken(data.token || "");
       }
-      if (event === "meta" && data.taskId) {
-        setRunStatus(`Queued: ${data.taskId}`);
-        setRemoteStatus(`Task ${data.taskId} queued.`);
+      if (event === "meta") {
+        if (data.chatId) {
+          state.chatId = data.chatId;
+          localStorage.setItem("remoteContinueChatId", state.chatId);
+        }
+        if (data.taskId) {
+          setRunStatus(`Queued: ${data.taskId}`);
+          setRemoteStatus(`Task ${data.taskId} queued.`);
+        }
       }
       if (event === "log") {
         const message = data.message || "";
@@ -155,7 +322,7 @@ async function readEventStream(response) {
       if (event === "result") showDownloadLinks(data.files || []);
       if (event === "error") {
         setRunStatus("Failed.", false);
-        append(`\nERROR: ${data.error}\n`);
+        appendAssistantToken(`\nERROR: ${data.error}\n`);
       }
       if (event === "done") setRunStatus(data.code === 0 ? "Done." : `Exit ${data.code}`, false);
     }
@@ -165,16 +332,21 @@ async function readEventStream(response) {
 async function runAgent(event) {
   event.preventDefault();
   const prompt = $("prompt").value.trim();
-  if (!prompt || currentRunId) return;
-  const selected = selectedRemoteInputs();
+  if ((!prompt && !state.attachments.length) || currentRunId) return;
+  const selected = [...state.attachments];
   currentRunId = `ui-${Date.now().toString(36)}`;
   controller = new AbortController();
   $("send").disabled = true;
   $("stop").disabled = false;
   clearDownloadLinks();
-  setRunStatus(selected.length ? `Uploading ${selected.length} file(s)...` : "Creating task...");
-  append(`\n> ${prompt}\n`);
+  state.currentAssistantId = null;
+  const attachmentLine = selected.length
+    ? `\n\nAttached: ${selected.map((file) => file.webkitRelativePath || file.name).join(", ")}`
+    : "";
+  if (prompt) appendMessage("user", `${prompt}${attachmentLine}`);
+  else appendMessage("user", `Process attached files.${attachmentLine}`);
   $("prompt").value = "";
+  setRunStatus(selected.length ? `Uploading ${selected.length} file(s)...` : "Creating task...");
   try {
     const files = await buildUploadFiles(selected);
     const response = await fetch("/api/agent", {
@@ -183,7 +355,8 @@ async function runAgent(event) {
       signal: controller.signal,
       body: JSON.stringify({
         runId: currentRunId,
-        prompt,
+        chatId: state.chatId,
+        prompt: prompt || "Process the attached files.",
         localModel: $("remoteModel").value,
         auto: $("auto").checked,
         files,
@@ -194,21 +367,23 @@ async function runAgent(event) {
       if (response.status === 401) await refreshMe().catch(() => {});
       throw new Error(data.error || response.statusText);
     }
-    if (selected.length) {
-      $("remoteFiles").value = "";
-      $("remoteFolder").value = "";
-    }
+    state.attachments = [];
+    renderAttachments();
+    $("remoteFiles").value = "";
+    $("remoteFolder").value = "";
     await readEventStream(response);
   } catch (error) {
     setRunStatus(error.name === "AbortError" ? "Stopped." : "Failed.", false);
-    append(error.name === "AbortError" ? "\n[stopped]\n" : `\nERROR: ${error.message}\n`);
+    appendAssistantToken(error.name === "AbortError" ? "\n[stopped]\n" : `\nERROR: ${error.message}\n`);
   } finally {
     currentRunId = null;
     controller = null;
     $("send").disabled = false;
     $("stop").disabled = true;
     await refreshStatus().catch(() => {});
+    await refreshChats().catch(() => {});
     await refreshRemoteTasks().catch(() => {});
+    renderChats();
     $("prompt").focus();
   }
 }
@@ -363,6 +538,37 @@ async function refreshRemoteTasks() {
   setRemoteStatus(`${tasks.length} job(s).`);
 }
 
+function setupDropZone() {
+  const output = $("output");
+  const hint = $("dropHint");
+  const show = (event) => {
+    event.preventDefault();
+    output.classList.add("dragging");
+    hint.classList.remove("hidden");
+  };
+  const hide = (event) => {
+    event.preventDefault();
+    output.classList.remove("dragging");
+    hint.classList.add("hidden");
+  };
+  output.addEventListener("dragover", show);
+  output.addEventListener("dragenter", show);
+  output.addEventListener("dragleave", (event) => {
+    if (!output.contains(event.relatedTarget)) hide(event);
+  });
+  output.addEventListener("drop", (event) => {
+    hide(event);
+    addAttachments(event.dataTransfer?.files || []);
+    $("prompt").focus();
+  });
+  document.addEventListener("paste", (event) => {
+    const files = Array.from(event.clipboardData?.files || []);
+    if (!files.length) return;
+    addAttachments(files);
+    $("prompt").focus();
+  });
+}
+
 $("sendCode").addEventListener("click", sendCode);
 $("verifyCode").addEventListener("click", verifyCode);
 $("logout").addEventListener("click", logout);
@@ -371,6 +577,14 @@ $("stop").addEventListener("click", stopRun);
 $("remoteTaskForm").addEventListener("submit", createRemoteTask);
 $("refreshRemoteTasks").addEventListener("click", () => refreshRemoteTasks().catch((error) => setRemoteStatus(error.message)));
 $("connectDrive").addEventListener("click", connectDrive);
+$("newChat").addEventListener("click", newChat);
+$("attachFiles").addEventListener("click", () => $("chatFiles").click());
+$("chatFiles").addEventListener("change", () => {
+  addAttachments($("chatFiles").files);
+  $("chatFiles").value = "";
+});
+$("remoteFiles").addEventListener("change", () => addAttachments($("remoteFiles").files));
+$("remoteFolder").addEventListener("change", () => addAttachments($("remoteFolder").files));
 $("code").addEventListener("keydown", (event) => {
   if (event.key === "Enter") verifyCode();
 });
@@ -379,4 +593,6 @@ setInterval(() => {
   if (!$("app").classList.contains("hidden")) refreshRemoteTasks().catch(() => {});
 }, 15000);
 
+setupDropZone();
+renderMessages();
 refreshMe().catch((error) => setLoginStatus(error.message));

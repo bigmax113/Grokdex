@@ -20,6 +20,8 @@ const chatStoreFile = path.join(__dirname, "sessions", "chats.json");
 const chatStoreRepo = process.env.CHAT_STORE_REPO || "bigmax113/Grodex";
 const chatStoreBranch = process.env.CHAT_STORE_BRANCH || "main";
 const chatStorePath = process.env.CHAT_STORE_PATH || "data/chats.json";
+const chatHistoryMaxChars = Number(process.env.CHAT_HISTORY_MAX_CHARS || 180000);
+const chatMessageMaxChars = Number(process.env.CHAT_MESSAGE_MAX_CHARS || 120000);
 const driveProfilesFile = path.join(__dirname, "sessions", "drive-profiles.json");
 const llmProfilesFile = path.join(__dirname, "sessions", "llm-profiles.json");
 const remoteJobsDir = path.join(__dirname, "remote-jobs");
@@ -404,6 +406,7 @@ function normalizeChatStore(value) {
     sessions: sessionsList.map((session) => ({
       id: String(session.id),
       title: String(session.title || "New chat"),
+      ownerEmail: normalizedEmail(session.ownerEmail || ""),
       createdAt: session.createdAt || new Date().toISOString(),
       updatedAt: session.updatedAt || session.createdAt || new Date().toISOString(),
       messages: Array.isArray(session.messages) ? session.messages : [],
@@ -479,33 +482,79 @@ async function saveChatStore(store) {
   chatStoreSha = data.content?.sha || chatStoreSha;
 }
 
-async function listChats() {
+function chatVisibleTo(session, email) {
+  const owner = normalizedEmail(session.ownerEmail || "");
+  return !owner || owner === normalizedEmail(email);
+}
+
+function publicChatSummary(session) {
+  return {
+    id: session.id,
+    title: session.title,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    messageCount: session.messages.filter((message) => message.role !== "system").length,
+  };
+}
+
+function sanitizeChatMessage(message) {
+  const role = ["system", "user", "assistant"].includes(message?.role) ? message.role : "user";
+  const content = String(message?.content || "").slice(0, chatMessageMaxChars);
+  return {
+    role,
+    content,
+    createdAt: message?.createdAt || new Date().toISOString(),
+  };
+}
+
+function compactChatHistory(messages, maxChars = chatHistoryMaxChars) {
+  const selected = [];
+  let total = 0;
+  const usable = (Array.isArray(messages) ? messages : [])
+    .map(sanitizeChatMessage)
+    .filter((message) => message.content.trim());
+  for (let index = usable.length - 1; index >= 0; index -= 1) {
+    const message = usable[index];
+    const size = message.content.length + message.role.length + 16;
+    if (selected.length && total + size > maxChars) break;
+    selected.unshift(message);
+    total += size;
+  }
+  return selected;
+}
+
+async function listChats(email) {
   const store = await loadChatStore({ force: chatStoreUsesGithub() });
   return [...store.sessions]
+    .filter((session) => chatVisibleTo(session, email))
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
-    .map((session) => ({
-      id: session.id,
-      title: session.title,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      messageCount: session.messages.length,
-    }));
+    .map(publicChatSummary);
 }
 
-async function getChat(id) {
+async function getChat(id, email = "") {
   const store = await loadChatStore();
-  return store.sessions.find((session) => session.id === id) || null;
+  const session = store.sessions.find((item) => item.id === id) || null;
+  if (!session || !chatVisibleTo(session, email)) return null;
+  return session;
 }
 
-async function ensureChat(id, firstPrompt = "") {
+async function ensureChat(id, firstPrompt = "", ownerEmail = "") {
   const store = await loadChatStore();
   const existing = id ? store.sessions.find((session) => session.id === id) : null;
-  if (existing) return existing;
+  if (existing) {
+    if (!chatVisibleTo(existing, ownerEmail)) throw new Error("Chat not found");
+    if (!existing.ownerEmail && ownerEmail) {
+      existing.ownerEmail = normalizedEmail(ownerEmail);
+      await saveChatStore(store);
+    }
+    return existing;
+  }
 
   const now = new Date().toISOString();
   const session = {
     id: id || `chat-${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`,
     title: titleFromText(firstPrompt),
+    ownerEmail: normalizedEmail(ownerEmail),
     createdAt: now,
     updatedAt: now,
     messages: [],
@@ -519,11 +568,7 @@ async function appendChatMessage(chatId, message) {
   const store = await loadChatStore();
   const session = store.sessions.find((item) => item.id === chatId);
   if (!session) return;
-  session.messages.push({
-    role: message.role,
-    content: String(message.content || ""),
-    createdAt: new Date().toISOString(),
-  });
+  session.messages.push(sanitizeChatMessage({ ...message, createdAt: new Date().toISOString() }));
   if (!session.title || session.title === "New chat") {
     const firstUser = session.messages.find((item) => item.role === "user");
     session.title = titleFromText(firstUser?.content);
@@ -532,10 +577,53 @@ async function appendChatMessage(chatId, message) {
   await saveChatStore(store);
 }
 
-async function deleteChat(id) {
+async function deleteChat(id, email = "") {
   const store = await loadChatStore();
-  store.sessions = store.sessions.filter((session) => session.id !== id);
+  store.sessions = store.sessions.filter((session) => session.id !== id || !chatVisibleTo(session, email));
   await saveChatStore(store);
+}
+
+function safeChatId(id) {
+  const value = String(id || "");
+  if (!/^[a-zA-Z0-9_-]{8,100}$/.test(value)) throw new Error("Invalid chat id");
+  return value;
+}
+
+async function handleChatList(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  json(res, 200, { chats: await listChats(session.email) });
+}
+
+async function handleChatGet(req, res, id) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const chat = await getChat(safeChatId(id), session.email);
+  if (!chat) {
+    json(res, 404, { error: "Chat not found" });
+    return;
+  }
+  json(res, 200, {
+    chat: {
+      ...publicChatSummary(chat),
+      messages: compactChatHistory(chat.messages, chatHistoryMaxChars),
+    },
+  });
+}
+
+async function handleChatCreate(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const body = await readBody(req);
+  const chat = await ensureChat(body.id ? safeChatId(body.id) : "", body.title || "New chat", session.email);
+  json(res, 201, { chat: { ...publicChatSummary(chat), messages: compactChatHistory(chat.messages) } });
+}
+
+async function handleChatDelete(req, res, id) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  await deleteChat(safeChatId(id), session.email);
+  json(res, 200, { ok: true });
 }
 
 function safeRemoteId(value) {
@@ -1704,6 +1792,8 @@ async function createRemoteTaskRecord(session, body) {
     storage,
     model: selectedModel,
     llmProfile: publicLlmProfile(llmProfile),
+    chatId: body.chatId ? safeChatId(body.chatId) : null,
+    chatHistory: compactChatHistory(body.chatHistory || [], chatHistoryMaxChars),
     pipeline: {
       xliffTranslationRequired,
     },
@@ -1800,6 +1890,8 @@ async function handleWorkerNext(req, res) {
       id: task.id,
       prompt: task.prompt,
       createdAt: task.createdAt,
+      chatId: task.chatId || null,
+      chatHistory: compactChatHistory(task.chatHistory || [], chatHistoryMaxChars),
       model: task.model || remoteModelForRequest("qwen"),
       llmProfile: workerLlmProfile(llmProfile),
       pipeline: task.pipeline || { xliffTranslationRequired: false },
@@ -1827,6 +1919,7 @@ async function handleWorkerOutput(req, res, id) {
   const stream = localAgentStreams.get(id);
   if (chunk && stream && !stream.res.destroyed && !stream.res.writableEnded) {
     stream.hadOutput = true;
+    stream.assistantText = `${stream.assistantText || ""}${chunk}`;
     sse(stream.res, "token", { token: chunk });
   }
   json(res, 200, { ok: true, delivered: Boolean(stream) });
@@ -1971,10 +2064,17 @@ function publicUrl(req, value) {
 
 async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
   let task;
+  let chat;
+  let assistantText = "";
   try {
+    chat = await ensureChat(body.chatId ? safeChatId(body.chatId) : "", prompt, session.email);
+    const chatHistory = compactChatHistory(chat.messages, chatHistoryMaxChars);
+    await appendChatMessage(chat.id, { role: "user", content: prompt });
     task = await createRemoteTaskRecord(session, {
       prompt,
       model: body.localModel || body.provider || "qwen",
+      chatId: chat.id,
+      chatHistory,
       files: Array.isArray(body.files) ? body.files : [],
     });
   } catch (error) {
@@ -1990,13 +2090,14 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
   sse(res, "meta", {
     runId: body.runId || task.id,
     taskId: task.id,
+    chatId: chat.id,
     stage: "queued",
     mode: "local-worker",
   });
 
   let logCount = 0;
   const startedAt = Date.now();
-  const streamState = { res, hadOutput: false };
+  const streamState = { res, hadOutput: false, assistantText: "" };
   localAgentStreams.set(task.id, streamState);
   try {
     while (!res.destroyed && !res.writableEnded) {
@@ -2027,7 +2128,16 @@ async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
           const text = (await readRemoteBlob(current.id, transcript)).toString("utf8").trim();
           const limit = 30000;
           const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
-          if (displayed) sse(res, "token", { token: `\n${displayed}\n` });
+          if (displayed) {
+            assistantText += `\n${displayed}\n`;
+            sse(res, "token", { token: `\n${displayed}\n` });
+          }
+        }
+        assistantText = (streamState.assistantText || assistantText).trim() || assistantText.trim();
+        if (assistantText) {
+          await appendChatMessage(chat.id, { role: "assistant", content: assistantText }).catch((error) => {
+            sse(res, "error", { error: `Chat save failed: ${error.message}` });
+          });
         }
         const files = (current.resultFiles || []).map((file) => ({
           id: file.id,
@@ -2073,7 +2183,8 @@ async function handleAgent(req, res) {
     return;
   }
   const id = body.runId || runId();
-  const chat = await ensureChat(body.chatId, prompt);
+  const chat = await ensureChat(body.chatId ? safeChatId(body.chatId) : "", prompt, session.email);
+  const chatHistory = compactChatHistory(chat.messages, chatHistoryMaxChars);
   await appendChatMessage(chat.id, { role: "user", content: prompt });
   const mode = body.model === "grok-4.3" ? "analysis" : "coding";
   const configPath = mode === "analysis" ? analysisConfigPath : codingConfigPath;
@@ -2088,6 +2199,14 @@ async function handleAgent(req, res) {
     "Never print secrets or environment variables.",
     "This is not the user's local machine.",
     "",
+    ...(chatHistory.length ? [
+      "Current chat history:",
+      ...chatHistory.flatMap((message) => [
+        `${message.role === "assistant" ? "Assistant" : message.role === "system" ? "System" : "User"}:`,
+        message.content,
+        "",
+      ]),
+    ] : []),
     prompt,
   ].join("\n");
 
@@ -2236,6 +2355,11 @@ const server = http.createServer(async (req, res) => {
         },
       });
     }
+    if (req.method === "GET" && url.pathname === "/api/chats") return await handleChatList(req, res);
+    if (req.method === "POST" && url.pathname === "/api/chats") return await handleChatCreate(req, res);
+    const chatMatch = url.pathname.match(/^\/api\/chats\/([^/]+)$/);
+    if (req.method === "GET" && chatMatch) return await handleChatGet(req, res, chatMatch[1]);
+    if (req.method === "DELETE" && chatMatch) return await handleChatDelete(req, res, chatMatch[1]);
     if (req.method === "GET" && url.pathname === "/api/drive/profile") return await handleDriveProfile(req, res);
     if (req.method === "POST" && url.pathname === "/api/drive/connect/start") return await handleDriveConnectStart(req, res);
     if (req.method === "GET" && url.pathname === "/api/drive/callback") return await handleDriveCallback(req, res, url);

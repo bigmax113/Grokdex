@@ -570,6 +570,25 @@ function visionAnalysisBlock(visionDescriptions) {
   return lines;
 }
 
+function conversationHistoryBlock(history) {
+  const messages = Array.isArray(history)
+    ? history.filter((message) => message?.content && ["user", "assistant", "system"].includes(message.role))
+    : [];
+  if (!messages.length) return [];
+  const lines = [
+    "Current chat history:",
+    "Use this history as the conversation context for follow-up questions. If the current request refers to a previous file, answer, presentation, screenshot, or conclusion, resolve that reference from this history before claiming missing inputs.",
+    "",
+  ];
+  for (const message of messages) {
+    const role = message.role === "assistant" ? "Assistant" : message.role === "system" ? "System" : "User";
+    lines.push(`${role}:`);
+    lines.push(String(message.content).trim());
+    lines.push("");
+  }
+  return lines;
+}
+
 function buildPrompt(task, inputDir, outputDir, inputFiles, visionDescriptions = []) {
   const fileList = inputFiles.length
     ? inputFiles.map((file) => `- ${file.relativePath || file.name}: ${file.path}`).join("\n")
@@ -589,6 +608,7 @@ function buildPrompt(task, inputDir, outputDir, inputFiles, visionDescriptions =
     "Answer in Russian unless the task explicitly asks for another language.",
     "",
     ...xliffTranslationPolicyBlock(task, inputFiles),
+    ...conversationHistoryBlock(task.chatHistory),
     ...visionAnalysisBlock(visionDescriptions),
     "Input files:",
     fileList,

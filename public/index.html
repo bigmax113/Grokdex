@@ -32,22 +32,55 @@
             <div id="runtime" class="muted"></div>
           </div>
           <div class="actions">
+            <label class="modelPicker">
+              Model
+              <select id="remoteModel">
+                <option value="qwen">LM Studio Qwen</option>
+                <option value="gemma-e2b">Gemma 4 E2B Q4</option>
+                <option value="gemma-e4b">Gemma 4 E4B Q4</option>
+                <option value="grok-build" disabled>Grok Build 0.1</option>
+                <option value="grok-general" disabled>Grok 4.3</option>
+              </select>
+            </label>
             <label class="check"><input id="auto" type="checkbox" /> Auto edits</label>
             <button id="logout" type="button">Logout</button>
           </div>
         </header>
 
         <section class="workbench">
+          <aside class="chatRail">
+            <div class="railHeader">
+              <div class="mark small">AI</div>
+              <div>
+                <strong>Remote Agent</strong>
+                <div class="muted">Qwen + local worker</div>
+              </div>
+            </div>
+            <button id="newChat" class="newChatButton" type="button">New chat</button>
+            <div id="chatList" class="chatList"></div>
+          </aside>
+
           <section class="chat">
-            <pre id="output"></pre>
+            <div class="chatTitleRow">
+              <label>
+                Chat
+                <input id="chatTitle" type="text" value="New chat" readonly />
+              </label>
+            </div>
+            <div id="output" class="messageList" aria-live="polite">
+              <div id="dropHint" class="dropHint hidden">Drop files here</div>
+            </div>
             <div id="runStatus" class="runStatus hidden">
               <span class="spinner" aria-hidden="true"></span>
               <span id="runStatusText">Idle</span>
             </div>
             <div id="downloadBar" class="downloadBar hidden"></div>
+            <div id="attachmentBar" class="attachmentBar hidden"></div>
             <form id="promptForm" class="composer">
               <textarea id="prompt" rows="5" placeholder="Ask through the local worker..."></textarea>
               <div class="composerActions">
+                <input id="chatFiles" class="hidden" type="file" multiple />
+                <button id="attachFiles" type="button" title="Attach files">+</button>
                 <button id="stop" type="button" disabled>Stop</button>
                 <button id="send" type="submit">Send to local worker</button>
               </div>
@@ -74,16 +107,6 @@
               <label>
                 Task
                 <textarea id="remotePrompt" rows="4" placeholder="Translate, analyze, extract, convert..."></textarea>
-              </label>
-              <label>
-                Local model
-                <select id="remoteModel">
-                  <option value="qwen">LM Studio Qwen</option>
-                  <option value="gemma-e2b">LM Studio Gemma 4 E2B Q4</option>
-                  <option value="gemma-e4b">LM Studio Gemma 4 E4B Q4</option>
-                  <option value="grok-build" disabled>Grok Build 0.1 (disabled)</option>
-                  <option value="grok-general" disabled>Grok 4.3 (disabled)</option>
-                </select>
               </label>
               <label>
                 Files or archives
