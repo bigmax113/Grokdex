@@ -42,6 +42,7 @@ const xliffTranslationMaxUnits = Number(process.env.REMOTE_XLIFF_MAX_UNITS_PER_B
 const ensureProxyScript = path.join(projectRoot, "ensure-lmstudio-switch-proxy.ps1");
 const xliffReferenceScript = process.env.XLIFF_TRANSLATOR_REFERENCE_SCRIPT
   || "C:\\codex\\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py";
+const directXliffTranslation = String(process.env.REMOTE_WORKER_DIRECT_XLIFF_TRANSLATION || "true").toLowerCase() !== "false";
 
 if (!renderUrl) throw new Error("RENDER_AGENT_URL or BASE_URL is required");
 if (!workerToken) throw new Error("REMOTE_WORKER_TOKEN is required");
@@ -590,6 +591,42 @@ function requiresXliffTranslation(task, inputFiles) {
   });
 }
 
+function targetLanguagesFromPrompt(text) {
+  const value = String(text || "").toLowerCase();
+  const matches = [
+    [/француз|french|français|francais/, "fr"],
+    [/чеш|czech|češt|cest|cs\b/, "cs"],
+    [/немец|german|deutsch|de\b/, "de"],
+    [/англий|english|en\b/, "en"],
+    [/русск|russian|ru\b/, "ru"],
+    [/украин|ukrainian|uk\b/, "uk"],
+    [/польск|polish|pl\b/, "pl"],
+    [/румын|romanian|ro\b/, "ro"],
+    [/испан|spanish|es\b/, "es"],
+    [/итальян|italian|it\b/, "it"],
+  ];
+  const langs = [];
+  for (const [pattern, lang] of matches) {
+    if (pattern.test(value) && !langs.includes(lang)) langs.push(lang);
+  }
+  return langs.length ? langs : [process.env.REMOTE_XLIFF_DEFAULT_TARGET_LANG || "ru"];
+}
+
+function sourceLanguageFromPrompt(text) {
+  const value = String(text || "").toLowerCase();
+  if (/с\s+англий|from\s+english|en\s*[-→>]/.test(value)) return "en";
+  if (/с\s+русск|from\s+russian|ru\s*[-→>]/.test(value)) return "ru";
+  if (/с\s+немец|from\s+german|de\s*[-→>]/.test(value)) return "de";
+  return process.env.REMOTE_XLIFF_SOURCE_LANG || "en";
+}
+
+function directXliffSupportedFiles(inputFiles) {
+  return inputFiles.filter((file) => {
+    const name = String(file.relativePath || file.name || "").toLowerCase();
+    return /\.(docx|pdf)$/.test(name) && !path.basename(name).startsWith("~$");
+  });
+}
+
 function xliffTranslationPolicyBlock(task, inputFiles) {
   if (!requiresXliffTranslation(task, inputFiles)) return [];
   return [
@@ -774,6 +811,202 @@ async function runContinue(taskId, prompt, runConfig) {
   });
 }
 
+function directXliffRunnerScript() {
+  return String.raw`
+import json
+import os
+import shutil
+import sys
+import traceback
+import types
+from pathlib import Path
+
+translator_path = Path(sys.argv[1])
+input_dir = Path(sys.argv[2])
+output_dir = Path(sys.argv[3])
+source_lang = sys.argv[4]
+target_langs = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
+files = [Path(item) for item in json.loads(sys.argv[6])]
+
+output_dir.mkdir(parents=True, exist_ok=True)
+
+source = translator_path.read_text(encoding="utf-8-sig")
+gui_marker = "\n# =====================\n# GUI actions"
+if gui_marker in source:
+    source = source.split(gui_marker, 1)[0]
+
+module = types.ModuleType("xliff_translator_core")
+module.__file__ = str(translator_path)
+sys.modules[module.__name__] = module
+exec(compile(source, str(translator_path), "exec"), module.__dict__)
+
+def log(message, level="INFO"):
+    print(f"[{level}] {message}", flush=True)
+
+module.pump_ui_events = lambda: None
+module.wait_if_paused = lambda reason="": None
+module.set_status = lambda message: log(message, "STATUS")
+module.set_progress = lambda pct: log(f"progress={float(pct):.1f}%", "PROGRESS")
+module.log_to_shell = log
+
+produced = []
+
+def copy_result(path, prefix=""):
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    name = f"{prefix}{path.name}" if prefix else path.name
+    target = output_dir / name
+    if path.resolve() != target.resolve():
+        shutil.copy2(path, target)
+    produced.append(str(target))
+    return target
+
+try:
+    if not target_langs:
+        raise RuntimeError("No target languages were detected for direct XLIFF translation")
+    if not files:
+        raise RuntimeError("No supported DOCX/PDF files were found for direct XLIFF translation")
+
+    for target_lang in target_langs:
+        log(f"Direct XLIFF translation started: {source_lang}->{target_lang}; files={len(files)}")
+        for file_path in files:
+            suffix = file_path.suffix.lower()
+            log(f"Processing {file_path.name} via reference XLIFF pipeline")
+            if suffix == ".docx":
+                translated_xliff, translated_doc = module.process_docx_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
+                copy_result(translated_xliff)
+                copy_result(translated_doc)
+            elif suffix == ".pdf":
+                translated_xliff, translated_pdf = module.process_pdf_pipeline(str(file_path), source_lang, target_lang, work_root=output_dir)
+                copy_result(translated_xliff)
+                copy_result(translated_pdf)
+            else:
+                raise RuntimeError(f"Unsupported file for direct XLIFF runner: {file_path}")
+
+    summary = output_dir / "result.md"
+    summary.write_text(
+        "# Direct XLIFF translation\n\n"
+        f"Source language: {source_lang}\n\n"
+        f"Target languages: {', '.join(target_langs)}\n\n"
+        "Generated files:\n"
+        + "\n".join(f"- {Path(item).name}" for item in produced)
+        + "\n",
+        encoding="utf-8",
+    )
+    print("DIRECT_XLIFF_DONE " + json.dumps({"files": produced}, ensure_ascii=False), flush=True)
+except Exception:
+    traceback.print_exc()
+    raise
+`;
+}
+
+async function runDirectXliffTranslation(taskId, task, inputFiles, taskDir, outputDir) {
+  await ensureLmStudioSwitchProxy();
+  const supported = directXliffSupportedFiles(inputFiles);
+  if (!supported.length) {
+    throw new Error("Direct XLIFF runner currently supports DOCX/PDF inputs for translation jobs");
+  }
+
+  const sourceLang = sourceLanguageFromPrompt(task.prompt);
+  const targetLangs = targetLanguagesFromPrompt(task.prompt);
+  const scriptPath = path.join(taskDir, "direct-xliff-runner.py");
+  await fsp.writeFile(scriptPath, directXliffRunnerScript(), "utf8");
+
+  const env = {
+    ...process.env,
+    ...xliffTranslatorEnv(),
+    LM_STUDIO_API_URL: process.env.LM_STUDIO_API_URL || "http://localhost:1234/v1/chat/completions",
+    LM_STUDIO_API_TOKEN: process.env.LMSTUDIO_API_TOKEN || process.env.LM_STUDIO_API_TOKEN || "lmstudio",
+    LM_STUDIO_FULL_RESTART: process.env.LM_STUDIO_FULL_RESTART || "0",
+    LM_STUDIO_STOP_AFTER_SESSION: process.env.LM_STUDIO_STOP_AFTER_SESSION || "0",
+    LM_MODEL_CLEAN_START_DELAY_SECONDS: process.env.LM_MODEL_CLEAN_START_DELAY_SECONDS || "0",
+    NO_COLOR: "1",
+  };
+  const args = [
+    "-3.11",
+    scriptPath,
+    xliffReferenceScript,
+    path.join(taskDir, "inputs"),
+    outputDir,
+    sourceLang,
+    targetLangs.join(","),
+    JSON.stringify(supported.map((file) => file.path)),
+  ];
+
+  await logRemote(
+    taskId,
+    `Direct XLIFF runner started (${sourceLang}->${targetLangs.join(", ")}; files=${supported.length}; context=${xliffTranslationContextWindow}; batch_source=${xliffTranslationSourceTokens}; target_output=${xliffTranslationOutputTokens})`,
+  );
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn("py", args, {
+      cwd: projectRoot,
+      env,
+      windowsHide: true,
+    });
+    let transcript = "";
+    let settled = false;
+    let cancelPollInFlight = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      killProcessTree(child.pid);
+      void hardStopLmStudioGeneration(taskId, "direct XLIFF timeout");
+      reject(new Error(`Direct XLIFF task timed out after ${Math.round(taskTimeoutMs / 1000)} seconds`));
+    }, taskTimeoutMs);
+    const cancelTimer = setInterval(async () => {
+      if (settled || cancelPollInFlight) return;
+      cancelPollInFlight = true;
+      try {
+        const status = await remoteTaskStatus(taskId);
+        if (status.cancelRequested) {
+          settled = true;
+          clearTimeout(timer);
+          clearInterval(cancelTimer);
+          await logRemote(taskId, "Cancellation received; stopping direct XLIFF translation");
+          killProcessTree(child.pid);
+          await hardStopLmStudioGeneration(taskId, "direct XLIFF cancellation");
+          reject(new Error("Stopped by user"));
+        }
+      } catch {
+        // Best-effort cancellation polling.
+      } finally {
+        cancelPollInFlight = false;
+      }
+    }, 1500);
+
+    const collect = (chunk, streamName) => {
+      const text = chunk.toString("utf8");
+      transcript += text;
+      streamRemoteOutput(taskId, text);
+      for (const line of text.split(/\r?\n/)) {
+        const clean = line.trim();
+        if (clean) logRemote(taskId, clean).catch(() => {});
+      }
+      if (streamName === "stderr") console.warn(`[${taskId}] ${text}`);
+    };
+
+    child.stdout.on("data", (chunk) => collect(chunk, "stdout"));
+    child.stderr.on("data", (chunk) => collect(chunk, "stderr"));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(cancelTimer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(cancelTimer);
+      if (code !== 0) reject(new Error(`Direct XLIFF runner exited with code ${code}`));
+      else resolve({ code, transcript });
+    });
+  });
+}
+
 async function listResultFiles(dir) {
   const out = [];
   let total = 0;
@@ -937,9 +1170,21 @@ async function processTask(task) {
 
   try {
     await fsp.mkdir(outputDir, { recursive: true });
-    await logRemote(task.id, `Worker ${workerId} started direct Continue runner`);
+    await logRemote(task.id, `Worker ${workerId} started`);
     const inputFiles = await saveInputFiles(task, inputDir);
     await logRemote(task.id, `Saved ${inputFiles.length} input file(s) locally`);
+
+    if (directXliffTranslation && requiresXliffTranslation(task, inputFiles)) {
+      const result = await runDirectXliffTranslation(task.id, task, inputFiles, taskDir, outputDir);
+      transcript = result.transcript || "";
+      let outputFiles = await listResultFiles(outputDir);
+      if (!outputFiles.length) throw new Error("Direct XLIFF runner finished without creating files");
+      const archived = await packageOutputArchive(outputDir);
+      const files = await collectResultFiles(outputDir, { onlyArchive: archived });
+      await completeTask(task.id, { status: "done", transcript, files });
+      await logRemote(task.id, `Completed direct XLIFF translation with ${files.length} result file(s)`);
+      return;
+    }
 
     const imageCount = inputFiles.filter(isImageFile).length;
     if (imageCount) await logRemote(task.id, `Analyzing ${imageCount} image file(s) with LM Studio vision (${lmStudioVisionModel})`);
