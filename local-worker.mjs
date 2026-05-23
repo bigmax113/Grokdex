@@ -34,6 +34,11 @@ const accessFile = path.resolve(process.env.REMOTE_WORKER_ACCESS_FILE || path.jo
 const lmStudioAdminBase = String(process.env.LMSTUDIO_ADMIN_BASE || "http://127.0.0.1:1234/api/v1").replace(/\/+$/, "");
 const lmStudioSwitchBase = String(process.env.LMSTUDIO_SWITCH_BASE || "http://127.0.0.1:1235/v1").replace(/\/+$/, "");
 const lmStudioVisionModel = process.env.REMOTE_WORKER_VISION_MODEL || "google/gemma-4-e4b";
+const xliffTranslationContextWindow = Number(process.env.REMOTE_XLIFF_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || 20000);
+const xliffTranslationSourceTokens = Number(process.env.REMOTE_XLIFF_BATCH_SOURCE_TOKENS || process.env.LM_BATCH_SOURCE_TOKENS || 8000);
+const xliffTranslationOutputTokens = Number(process.env.REMOTE_XLIFF_TARGET_OUTPUT_TOKENS || process.env.LM_FULL_CONTEXT_TARGET_OUTPUT_TOKENS || 9000);
+const xliffTranslationMinOutputTokens = Number(process.env.REMOTE_XLIFF_MIN_OUTPUT_TOKENS || process.env.LM_FULL_CONTEXT_MIN_OUTPUT_TOKENS || 6000);
+const xliffTranslationMaxUnits = Number(process.env.REMOTE_XLIFF_MAX_UNITS_PER_BLOCK || process.env.LM_MAX_UNITS_PER_BLOCK || 200);
 const ensureProxyScript = path.join(projectRoot, "ensure-lmstudio-switch-proxy.ps1");
 const xliffReferenceScript = process.env.XLIFF_TRANSLATOR_REFERENCE_SCRIPT
   || "C:\\codex\\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py";
@@ -282,6 +287,25 @@ function personalContinueConfig(profile) {
   ].filter((line) => line !== "").join("\n");
 }
 
+function xliffTranslatorEnv() {
+  return {
+    LM_CONTEXT_WINDOW: String(xliffTranslationContextWindow),
+    LM_BATCH_SOURCE_TOKENS: String(xliffTranslationSourceTokens),
+    LM_MAX_UNITS_PER_BLOCK: String(xliffTranslationMaxUnits),
+    LM_ENABLE_FULL_CONTEXT_WINDOWS: process.env.REMOTE_XLIFF_ENABLE_FULL_CONTEXT_WINDOWS || "1",
+    LM_FULL_CONTEXT_MIN_OUTPUT_TOKENS: String(xliffTranslationMinOutputTokens),
+    LM_FULL_CONTEXT_TARGET_OUTPUT_TOKENS: String(xliffTranslationOutputTokens),
+    LM_FULL_CONTEXT_MAX_UNITS_PER_REQUEST: String(xliffTranslationMaxUnits),
+    XLIFF_TERMINOLOGY_LOCK_ENABLED: process.env.XLIFF_TERMINOLOGY_LOCK_ENABLED || "1",
+    XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS: process.env.XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS || "1",
+    XLIFF_TERMINOLOGY_AUDIT_ONLY: process.env.XLIFF_TERMINOLOGY_AUDIT_ONLY || "0",
+    XLIFF_POST_BATCH_AUDIT_ENABLED: process.env.XLIFF_POST_BATCH_AUDIT_ENABLED || "1",
+    XLIFF_TAG_THINKING_REPAIR_ENABLED: process.env.XLIFF_TAG_THINKING_REPAIR_ENABLED || "1",
+    LM_EMBEDDING_MEMORY_ENABLED: process.env.LM_EMBEDDING_MEMORY_ENABLED || "1",
+    DOCUMENT_TRANSLATION_CACHE_ENABLED: process.env.DOCUMENT_TRANSLATION_CACHE_ENABLED || "1",
+  };
+}
+
 async function prepareContinueRun(task, taskDir) {
   const profile = task.llmProfile;
   if (profile?.model && profile?.apiBase) {
@@ -289,7 +313,7 @@ async function prepareContinueRun(task, taskDir) {
     await fsp.writeFile(config, personalContinueConfig(profile), "utf8");
     return {
       config,
-      env: profile.apiKey ? { REMOTE_TASK_LLM_API_KEY: profile.apiKey } : {},
+      env: { ...xliffTranslatorEnv(), ...(profile.apiKey ? { REMOTE_TASK_LLM_API_KEY: profile.apiKey } : {}) },
       label: `personal:${profile.model}`,
     };
   }
@@ -297,7 +321,7 @@ async function prepareContinueRun(task, taskDir) {
   const config = baseContinueConfigPath(selectedProvider);
   return {
     config,
-    env: { LMSTUDIO_API_TOKEN: process.env.LMSTUDIO_API_TOKEN || "lmstudio" },
+    env: { ...xliffTranslatorEnv(), LMSTUDIO_API_TOKEN: process.env.LMSTUDIO_API_TOKEN || "lmstudio" },
     label: `${selectedProvider}:${path.basename(config)}`,
   };
 }
@@ -546,8 +570,13 @@ function xliffTranslationPolicyBlock(task, inputFiles) {
   return [
     "STRICT XLIFF TRANSLATION REQUIREMENT:",
     "The user is asking to translate/localize uploaded documents. Every document translation must go through XLIFF.",
-    "Required path: source document/archive -> extracted working files -> XLIFF trans-units -> translate XLIFF targets -> audit/repair tags and locked terms -> reconstruct final document from the translated XLIFF.",
+    "Required path: source document/archive -> extracted working files -> XLIFF trans-units -> document-level terminology/memory collection -> locked terminology index -> large batched translation -> post-batch audit/repair -> reconstruct final document from the translated XLIFF.",
     `Reference implementation on this machine: ${xliffReferenceScript}`,
+    "Use the reference implementation behavior, not a simplified translator. It first collects confirmed references, TMX/embedding memory, document terminology candidates, and terminology locks for the whole XLIFF/document set, then translates unconfirmed units in large token-budgeted batches.",
+    `Runtime XLIFF budget for this worker: LM_CONTEXT_WINDOW=${xliffTranslationContextWindow}, LM_BATCH_SOURCE_TOKENS=${xliffTranslationSourceTokens}, LM_MAX_UNITS_PER_BLOCK=${xliffTranslationMaxUnits}, LM_FULL_CONTEXT_MIN_OUTPUT_TOKENS=${xliffTranslationMinOutputTokens}, LM_FULL_CONTEXT_TARGET_OUTPUT_TOKENS=${xliffTranslationOutputTokens}.`,
+    "This applies to every document format: DOCX paragraphs, PDF lines, XLSX cells/rows/sheets, PPTX text boxes/shapes/slides, HTML/XML nodes, and archives of mixed documents must all be converted to XLIFF first and translated as batched trans-units.",
+    "Do not translate line-by-line, row-by-row, cell-by-cell, paragraph-by-paragraph, textbox-by-textbox, slide-by-slide, page-by-page, or one trans-unit per model call unless the reference implementation's fallback split is triggered by marker failure or post-batch audit failure.",
+    "Do not skip terminology unification. Keep XLIFF_TERMINOLOGY_LOCK_ENABLED=1, XLIFF_TERMINOLOGY_AUTO_DOCUMENT_TERMS=1, LM_EMBEDDING_MEMORY_ENABLED=1, DOCUMENT_TRANSLATION_CACHE_ENABLED=1, and XLIFF_POST_BATCH_AUDIT_ENABLED=1 unless the user explicitly disables them.",
     "For DOCX use the reference-style flow: docx_to_xliff -> translate_xliff_file -> xliff_to_docx.",
     "For PDF use the reference-style flow: pdf_to_xliff -> translate_xliff_file -> xliff_to_pdf_page_aware.",
     "For a mixed folder/archive, unpack it first, process every supported document through the XLIFF flow, preserve relative paths, and put all final documents plus useful XLIFF/audit artifacts into the output directory.",
