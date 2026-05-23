@@ -254,6 +254,10 @@ function rfc2822(value) {
   return String(value || "").replace(/[\r\n]+/g, " ").trim();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function sendGmailOAuthMail({ to, subject, text }) {
   if (!gmailOAuthMailerConfigured()) throw new Error("Gmail OAuth mailer is not configured");
   const { google } = await import("googleapis");
@@ -1604,22 +1608,12 @@ function decodeUploadFile(input, runningTotal) {
   return { name, relativePath, mime, buffer };
 }
 
-async function handleRemoteTaskCreate(req, res) {
-  const session = requireSession(req, res);
-  if (!session) return;
-  const body = await readBody(req);
+async function createRemoteTaskRecord(session, body) {
   const prompt = String(body.prompt || "").trim();
   const uploads = Array.isArray(body.files) ? body.files : [];
-  let selectedModel;
-  try {
-    selectedModel = remoteModelForRequest(body.model || body.provider);
-  } catch (error) {
-    json(res, 400, { error: error.message });
-    return;
-  }
+  const selectedModel = remoteModelForRequest(body.model || body.provider || "qwen");
   if (!prompt && !uploads.length) {
-    json(res, 400, { error: "Prompt or at least one file is required" });
-    return;
+    throw new Error("Prompt or at least one file is required");
   }
   const xliffTranslationRequired = hasTranslationIntent(prompt)
     && (!uploads.length || uploads.some(uploadLooksLikeDocument));
@@ -1658,8 +1652,7 @@ async function handleRemoteTaskCreate(req, res) {
     }
     preparedUploads = packageDatasetIfNeeded(decodedUploads);
   } catch (error) {
-    json(res, 400, { error: error.message });
-    return;
+    throw new Error(error.message);
   }
   const files = [];
   totalBytes = 0;
@@ -1701,6 +1694,20 @@ async function handleRemoteTaskCreate(req, res) {
     updatedAt: now,
   };
   await writeRemoteTask(task);
+  return task;
+}
+
+async function handleRemoteTaskCreate(req, res) {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const body = await readBody(req);
+  let task;
+  try {
+    task = await createRemoteTaskRecord(session, body);
+  } catch (error) {
+    json(res, 400, { error: error.message });
+    return;
+  }
   json(res, 201, { task: publicRemoteTask(task) });
 }
 
@@ -1919,6 +1926,84 @@ async function ensureWorkspace() {
   });
 }
 
+function publicUrl(req, value) {
+  const raw = String(value || "");
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host = req.headers.host || "localhost";
+  return `${proto}://${host}${raw.startsWith("/") ? raw : `/${raw}`}`;
+}
+
+async function handleAgentViaLocalWorker(req, res, session, body, prompt) {
+  let task;
+  try {
+    task = await createRemoteTaskRecord(session, {
+      prompt,
+      model: body.localModel || body.provider || "qwen",
+      files: [],
+    });
+  } catch (error) {
+    json(res, 400, { error: error.message });
+    return;
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  });
+  sse(res, "meta", {
+    runId: body.runId || task.id,
+    taskId: task.id,
+    stage: "queued",
+    mode: "local-worker",
+  });
+
+  let logCount = 0;
+  const startedAt = Date.now();
+  while (!res.destroyed && !res.writableEnded) {
+    if (Date.now() - startedAt > 30 * 60 * 1000) {
+      sse(res, "error", { error: `Local worker task ${task.id} is still running. Check Document jobs for results.` });
+      sse(res, "done", { code: 124 });
+      res.end();
+      return;
+    }
+
+    const current = await readRemoteTask(task.id, { email: session.email });
+    const logs = Array.isArray(current.logs) ? current.logs : [];
+    for (const log of logs.slice(logCount)) {
+      sse(res, "token", { token: `\n[${current.status}] ${log.message}\n` });
+    }
+    logCount = logs.length;
+
+    if (current.status === "failed") {
+      sse(res, "error", { error: current.error || "Local worker task failed" });
+      sse(res, "done", { code: 1 });
+      res.end();
+      return;
+    }
+
+    if (current.status === "done") {
+      const transcript = (current.resultFiles || []).find((file) => file.name === "transcript.txt");
+      if (transcript) {
+        const text = (await readRemoteBlob(current.id, transcript)).toString("utf8").trim();
+        const limit = 30000;
+        const displayed = text.length > limit ? `... transcript truncated ...\n${text.slice(-limit)}` : text;
+        if (displayed) sse(res, "token", { token: `\n${displayed}\n` });
+      }
+      const resultLinks = (current.resultFiles || [])
+        .map((file) => `- ${file.name}: ${publicUrl(req, file.downloadUrl || `/api/remote/tasks/${encodeURIComponent(current.id)}/download?file=${encodeURIComponent(file.id)}`)}`)
+        .join("\n");
+      if (resultLinks) sse(res, "token", { token: `\nResults:\n${resultLinks}\n` });
+      sse(res, "done", { code: 0 });
+      res.end();
+      return;
+    }
+
+    await sleep(3000);
+  }
+}
+
 async function handleAgent(req, res) {
   const session = requireSession(req, res);
   if (!session) return;
@@ -1929,8 +2014,7 @@ async function handleAgent(req, res) {
     return;
   }
   if (!renderDirectAgentEnabled) {
-    json(res, 403, { error: "Direct Render agent is disabled for the local-only test. Create a document/dataset job so the local worker handles it." });
-    return;
+    return await handleAgentViaLocalWorker(req, res, session, body, prompt);
   }
   if (!process.env.XAI_API_KEY) {
     json(res, 400, { error: "XAI_API_KEY is not configured" });
