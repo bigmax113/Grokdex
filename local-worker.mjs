@@ -16,8 +16,15 @@ const taskRoot = path.resolve(process.env.REMOTE_WORKER_TASK_ROOT || path.join(_
 const provider = process.env.REMOTE_WORKER_PROVIDER || "qwen";
 const mode = process.env.REMOTE_WORKER_MODE || "auto";
 const showThinking = String(process.env.REMOTE_WORKER_SHOW_THINKING || "false") === "true";
+const packageResults = String(process.env.REMOTE_WORKER_PACKAGE_RESULTS || "true").toLowerCase() !== "false";
 const maxResultBytes = Number(process.env.REMOTE_WORKER_MAX_RESULT_BYTES || 60 * 1024 * 1024);
 const taskTimeoutMs = Number(process.env.REMOTE_WORKER_TASK_TIMEOUT_MS || 2 * 60 * 60 * 1000);
+const accessFile = path.resolve(process.env.REMOTE_WORKER_ACCESS_FILE || path.join(__dirname, "remote-access.enabled"));
+const lmStudioAdminBase = String(process.env.LMSTUDIO_ADMIN_BASE || "http://127.0.0.1:1234/api/v1").replace(/\/+$/, "");
+const lmStudioSwitchBase = String(process.env.LMSTUDIO_SWITCH_BASE || "http://127.0.0.1:1235/v1").replace(/\/+$/, "");
+const ensureProxyScript = path.join(projectRoot, "ensure-lmstudio-switch-proxy.ps1");
+const xliffReferenceScript = process.env.XLIFF_TRANSLATOR_REFERENCE_SCRIPT
+  || "C:\\codex\\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py";
 const envFiles = String(process.env.REMOTE_WORKER_ENV_FILES || [
   path.join(localStackRoot, ".env"),
   path.join(__dirname, ".env"),
@@ -62,6 +69,125 @@ function safeName(name) {
     .slice(0, 160) || "file";
 }
 
+function safeRelativePath(name) {
+  const parts = String(name || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part) => safeName(part))
+    .filter((part) => part && part !== "." && part !== "..");
+  return parts.length ? parts.join("/") : "file";
+}
+
+function envBool(value, fallback = true) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (["1", "true", "yes", "on", "enabled", "allow"].includes(normalized)) return true;
+  if (["0", "false", "no", "off", "disabled", "pause", "paused", "deny"].includes(normalized)) return false;
+  return fallback;
+}
+
+async function remoteAccessStatus() {
+  const envEnabled = envBool(process.env.REMOTE_WORKER_ACCESS_ENABLED, true);
+  if (!envEnabled) {
+    return { enabled: false, reason: "REMOTE_WORKER_ACCESS_ENABLED=false", file: accessFile };
+  }
+  try {
+    const raw = (await fsp.readFile(accessFile, "utf8")).trim().toLowerCase();
+    if (!raw) return { enabled: true, reason: "empty access file", file: accessFile };
+    const enabled = envBool(raw, true);
+    return { enabled, reason: `${path.basename(accessFile)}=${raw}`, file: accessFile };
+  } catch (error) {
+    if (error.code === "ENOENT") return { enabled: true, reason: "access file missing", file: accessFile };
+    return { enabled: false, reason: `cannot read access file: ${error.message}`, file: accessFile };
+  }
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { dosTime, dosDate };
+}
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function zipFilesBuffer(files) {
+  const chunks = [];
+  const central = [];
+  const { dosTime, dosDate } = dosDateTime();
+  let offset = 0;
+
+  for (const file of files) {
+    const name = safeRelativePath(file.relativePath || file.name);
+    const nameBuffer = Buffer.from(name, "utf8");
+    const body = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || "");
+    const checksum = crc32(body);
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(dosTime, 10);
+    localHeader.writeUInt16LE(dosDate, 12);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(body.length, 18);
+    localHeader.writeUInt32LE(body.length, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(dosTime, 12);
+    centralHeader.writeUInt16LE(dosDate, 14);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(body.length, 20);
+    centralHeader.writeUInt32LE(body.length, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    chunks.push(localHeader, nameBuffer, body);
+    central.push(centralHeader, nameBuffer);
+    offset += localHeader.length + nameBuffer.length + body.length;
+  }
+
+  const centralSize = central.reduce((sum, item) => sum + item.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...chunks, ...central, end]);
+}
+
 function mimeFromName(name) {
   const ext = path.extname(name).toLowerCase();
   if (ext === ".txt" || ext === ".md" || ext === ".log") return "text/plain; charset=utf-8";
@@ -83,10 +209,20 @@ function yamlString(value) {
   return JSON.stringify(String(value ?? ""));
 }
 
-function baseContinueConfigPath() {
+function normalizeWorkerProvider(value) {
+  if (value === "grok" || value === "grok-build") return "grok-build";
+  if (value === "grok-general") return "grok-general";
+  if (value === "gemma-e2b" || value === "gemma-e4b") return value;
+  return "qwen";
+}
+
+function baseContinueConfigPath(providerId = provider) {
   if (process.env.REMOTE_WORKER_CONTINUE_CONFIG) return path.resolve(process.env.REMOTE_WORKER_CONTINUE_CONFIG);
-  if (provider === "grok-build" || provider === "grok") return path.join(localStackRoot, "continue-config-grok.yaml");
-  if (provider === "grok-general") return path.join(localStackRoot, "continue-config-grok-general.yaml");
+  const normalized = normalizeWorkerProvider(providerId);
+  if (normalized === "gemma-e2b") return path.join(localStackRoot, "continue-config-gemma-e2b.yaml");
+  if (normalized === "gemma-e4b") return path.join(localStackRoot, "continue-config-gemma-e4b.yaml");
+  if (normalized === "grok-build") return path.join(localStackRoot, "continue-config-grok.yaml");
+  if (normalized === "grok-general") return path.join(localStackRoot, "continue-config-grok-general.yaml");
   return path.join(localStackRoot, "continue-config.yaml");
 }
 
@@ -136,6 +272,8 @@ function personalContinueConfig(profile) {
     "rules:",
     "  - Prefer Russian for explanations when the user writes in Russian.",
     "  - Inspect relevant files first and follow the repository style.",
+    "  - If the user asks to translate or localize any uploaded document or archive, use an XLIFF roundtrip only: convert/extract to XLIFF, translate XLIFF targets while preserving tags/ids/placeholders, audit/repair, then reconstruct outputs from translated XLIFF.",
+    "  - Do not translate DOCX/PDF/XLSX/PPTX/HTML/XML text by directly reading it and writing a translated file with generic Python libraries; such libraries are allowed only for XLIFF conversion, reconstruction, and validation.",
     "  - Put requested downloadable deliverables into the output directory named in the prompt.",
     "  - Never print secrets or API keys.",
     "",
@@ -153,8 +291,9 @@ async function prepareContinueRun(task, taskDir) {
       label: `personal:${profile.model}`,
     };
   }
-  const config = baseContinueConfigPath();
-  return { config, env: {}, label: path.basename(config) };
+  const selectedProvider = normalizeWorkerProvider(task.model?.id || task.provider || provider);
+  const config = baseContinueConfigPath(selectedProvider);
+  return { config, env: {}, label: `${selectedProvider}:${path.basename(config)}` };
 }
 
 function continueExecutable() {
@@ -188,6 +327,71 @@ function killProcessTree(pid) {
   }
 }
 
+async function waitForHttp(url, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(1000) });
+      if (response.ok) return true;
+    } catch {
+      // Keep waiting until timeout.
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+async function ensureLmStudioSwitchProxy() {
+  if (String(process.env.REMOTE_WORKER_ENSURE_LMSTUDIO_PROXY || "true").toLowerCase() === "false") return;
+  if (await waitForHttp(`${lmStudioSwitchBase}/models`, 1500)) return;
+  if (!fs.existsSync(ensureProxyScript)) return;
+  await new Promise((resolve) => {
+    const child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      ensureProxyScript,
+    ], {
+      cwd: projectRoot,
+      windowsHide: true,
+    });
+    child.on("close", resolve);
+    child.on("error", resolve);
+  });
+  await waitForHttp(`${lmStudioSwitchBase}/models`, 10000);
+}
+
+async function lmStudioAdminJson(method, apiPath, payload) {
+  const response = await fetch(`${lmStudioAdminBase}${apiPath}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${process.env.LMSTUDIO_API_TOKEN || "lmstudio"}`,
+      "content-type": "application/json",
+    },
+    body: payload ? JSON.stringify(payload) : undefined,
+    signal: AbortSignal.timeout(60000),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || data.message || `${response.status} ${response.statusText}`);
+  return data;
+}
+
+async function unloadLoadedEmbeddingModels() {
+  if (String(process.env.REMOTE_WORKER_UNLOAD_EMBEDDINGS_AFTER || "true").toLowerCase() === "false") return 0;
+  const data = await lmStudioAdminJson("GET", "/models");
+  let unloaded = 0;
+  for (const model of data.models || []) {
+    if (model.type !== "embedding" && model.type !== "embeddings") continue;
+    for (const instance of model.loaded_instances || []) {
+      if (!instance.id) continue;
+      await lmStudioAdminJson("POST", "/models/unload", { instance_id: instance.id });
+      unloaded += 1;
+    }
+  }
+  return unloaded;
+}
+
 async function remoteJson(apiPath, options = {}) {
   const response = await fetch(`${renderUrl}${apiPath}`, {
     ...options,
@@ -215,30 +419,65 @@ async function saveInputFiles(task, inputDir) {
   await fsp.mkdir(inputDir, { recursive: true });
   const files = [];
   for (const file of task.files || []) {
-    const name = safeName(file.name);
-    const target = path.join(inputDir, name);
+    const relativePath = safeRelativePath(file.relativePath || file.name);
+    const name = safeName(path.basename(relativePath));
+    const target = path.join(inputDir, relativePath);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
     await fsp.writeFile(target, Buffer.from(String(file.base64 || ""), "base64"));
-    files.push({ ...file, name, path: target });
+    files.push({ ...file, name, relativePath, path: target });
   }
   return files;
 }
 
+function hasTranslationIntent(text) {
+  return /\b(translate|translation|translated|locali[sz]e|locali[sz]ation)\b|перевод|перевести|переведи|локализ/i.test(String(text || ""));
+}
+
+function requiresXliffTranslation(task, inputFiles) {
+  if (task.pipeline?.xliffTranslationRequired) return true;
+  if (!hasTranslationIntent(task.prompt)) return false;
+  if (!inputFiles.length) return true;
+  return inputFiles.some((file) => {
+    const name = String(file.relativePath || file.name || "").toLowerCase();
+    return /\.(docx?|pdf|pptx?|xlsx?|odt|ods|odp|rtf|html?|xml|xlf|xliff|zip|7z|rar|tar|tgz|gz|bz2|xz)$/.test(name);
+  });
+}
+
+function xliffTranslationPolicyBlock(task, inputFiles) {
+  if (!requiresXliffTranslation(task, inputFiles)) return [];
+  return [
+    "STRICT XLIFF TRANSLATION REQUIREMENT:",
+    "The user is asking to translate/localize uploaded documents. Every document translation must go through XLIFF.",
+    "Required path: source document/archive -> extracted working files -> XLIFF trans-units -> translate XLIFF targets -> audit/repair tags and locked terms -> reconstruct final document from the translated XLIFF.",
+    `Reference implementation on this machine: ${xliffReferenceScript}`,
+    "For DOCX use the reference-style flow: docx_to_xliff -> translate_xliff_file -> xliff_to_docx.",
+    "For PDF use the reference-style flow: pdf_to_xliff -> translate_xliff_file -> xliff_to_pdf_page_aware.",
+    "For a mixed folder/archive, unpack it first, process every supported document through the XLIFF flow, preserve relative paths, and put all final documents plus useful XLIFF/audit artifacts into the output directory.",
+    "Do not translate document prose by directly reading it and writing a new DOCX/PDF/XLSX/PPTX with generic Python libraries. Libraries such as python-docx, PyMuPDF, openpyxl, or XML/ZIP helpers may only be used for XLIFF conversion, reconstruction, and validation.",
+    "If a format cannot be reconstructed safely, still create and translate an intermediate XLIFF, include the translated XLIFF in results.zip, and write a short note explaining the reconstruction blocker.",
+    "",
+  ];
+}
+
 function buildPrompt(task, inputDir, outputDir, inputFiles) {
   const fileList = inputFiles.length
-    ? inputFiles.map((file) => `- ${file.name}: ${file.path}`).join("\n")
+    ? inputFiles.map((file) => `- ${file.relativePath || file.name}: ${file.path}`).join("\n")
     : "- no files";
   return [
     `Remote task ${task.id}.`,
     `Workspace: ${projectRoot}`,
     `Input directory: ${inputDir}`,
     `Output directory: ${outputDir}`,
+    `Selected local model: ${task.model?.name || task.model?.id || provider}.`,
     "",
-    "Use the input files and the local filesystem directly.",
-    "Put every final downloadable deliverable into the output directory.",
+    "Use the input files and the local filesystem directly. Archives may contain full datasets; unpack them when needed.",
+    "For dataset/RAG/conversion tasks, process every relevant input file, preserve useful relative paths, and write machine-readable outputs into the output directory.",
+    "Write final artifacts into the output directory; the worker will always package them as results.zip.",
     "If the task is pure analysis, create result.md in the output directory with the final answer.",
     "Do not put secrets into outputs or logs.",
     "Answer in Russian unless the task explicitly asks for another language.",
     "",
+    ...xliffTranslationPolicyBlock(task, inputFiles),
     "Input files:",
     fileList,
     "",
@@ -277,6 +516,7 @@ function spawnContinue(prompt, runConfig) {
 }
 
 async function runContinue(taskId, prompt, runConfig) {
+  await ensureLmStudioSwitchProxy();
   const { child, config, args } = spawnContinue(prompt, runConfig);
   let transcript = "";
   let settled = false;
@@ -318,7 +558,7 @@ async function runContinue(taskId, prompt, runConfig) {
   });
 }
 
-async function collectResultFiles(dir) {
+async function listResultFiles(dir) {
   const out = [];
   let total = 0;
 
@@ -336,15 +576,53 @@ async function collectResultFiles(dir) {
       if (total > maxResultBytes) throw new Error(`Result files exceed ${maxResultBytes} bytes`);
       const relative = path.relative(dir, fullPath).replace(/\\/g, "/");
       out.push({
-        name: safeName(relative),
+        name: safeName(path.basename(relative)),
+        relativePath: safeRelativePath(relative),
         mime: mimeFromName(relative),
-        base64: (await fsp.readFile(fullPath)).toString("base64"),
+        path: fullPath,
+        size: stat.size,
       });
     }
   }
 
   await walk(dir);
   return out;
+}
+
+async function collectResultFiles(dir, { onlyArchive = false } = {}) {
+  if (onlyArchive) {
+    const archivePath = path.join(dir, "results.zip");
+    const stat = await fsp.stat(archivePath);
+    return [{
+      name: "results.zip",
+      relativePath: "results.zip",
+      mime: "application/zip",
+      base64: (await fsp.readFile(archivePath)).toString("base64"),
+      size: stat.size,
+    }];
+  }
+  const listed = await listResultFiles(dir);
+  return await Promise.all(listed.map(async (file) => ({
+    name: file.name,
+    relativePath: file.relativePath,
+    mime: file.mime,
+    base64: (await fsp.readFile(file.path)).toString("base64"),
+  })));
+}
+
+async function packageOutputArchive(outputDir) {
+  if (!packageResults) return false;
+  const files = (await listResultFiles(outputDir)).filter((file) => file.relativePath !== "results.zip");
+  if (!files.length) return false;
+  const zipEntries = await Promise.all(files.map(async (file) => ({
+    name: file.name,
+    relativePath: file.relativePath,
+    buffer: await fsp.readFile(file.path),
+  })));
+  const buffer = zipFilesBuffer(zipEntries);
+  if (buffer.length > maxResultBytes) throw new Error(`results.zip exceeds ${maxResultBytes} bytes`);
+  await fsp.writeFile(path.join(outputDir, "results.zip"), buffer);
+  return true;
 }
 
 async function completeTask(taskId, payload) {
@@ -372,12 +650,14 @@ async function processTask(task) {
     transcript = result.transcript || "";
     if (result.code !== 0) throw new Error(`Continue exited with code ${result.code}`);
 
-    let files = await collectResultFiles(outputDir);
-    if (!files.length) {
+    let outputFiles = await listResultFiles(outputDir);
+    if (!outputFiles.length) {
       const fallback = transcript.trim() ? transcript.trim() : "Continue finished without creating files.";
       await fsp.writeFile(path.join(outputDir, "result.md"), `${fallback}\n`, "utf8");
-      files = await collectResultFiles(outputDir);
+      outputFiles = await listResultFiles(outputDir);
     }
+    const archived = await packageOutputArchive(outputDir);
+    const files = await collectResultFiles(outputDir, { onlyArchive: archived });
 
     await completeTask(task.id, { status: "done", transcript, files });
     await logRemote(task.id, `Completed with ${files.length} result file(s)`);
@@ -391,6 +671,13 @@ async function processTask(task) {
       console.error(`[${task.id}] failed to report failure: ${completeError.message}`);
     });
     console.error(`[${task.id}] failed: ${error.stack || error.message}`);
+  } finally {
+    try {
+      const unloaded = await unloadLoadedEmbeddingModels();
+      if (unloaded) await logRemote(task.id, `Unloaded ${unloaded} embedding model instance(s)`);
+    } catch (error) {
+      console.warn(`[${task.id}] embedding unload skipped: ${error.message}`);
+    }
   }
 }
 
@@ -404,9 +691,24 @@ async function pollOnce() {
 console.log(`Remote worker ${workerId} polling ${renderUrl}`);
 console.log(`Direct Continue workspace: ${projectRoot}`);
 console.log(`Continue config: ${continueConfigPath()}`);
+console.log(`Remote access gate: ${accessFile}`);
 
+let accessWasDisabled = false;
 while (true) {
   try {
+    const access = await remoteAccessStatus();
+    if (!access.enabled) {
+      if (!accessWasDisabled) {
+        console.log(`Remote access disabled; worker will not claim external jobs (${access.reason})`);
+        accessWasDisabled = true;
+      }
+      await sleep(pollIntervalMs);
+      continue;
+    }
+    if (accessWasDisabled) {
+      console.log(`Remote access enabled; worker is polling again (${access.reason})`);
+      accessWasDisabled = false;
+    }
     const hadTask = await pollOnce();
     if (!hadTask) await sleep(pollIntervalMs);
   } catch (error) {

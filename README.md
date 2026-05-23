@@ -9,17 +9,39 @@ The useful path is:
 3. Upload documents and create a job.
 4. Render stores the job and files in Google Drive.
 5. This Windows laptop runs `local-worker.mjs`, polls Render, launches local Continue directly, and writes final files back to Google Drive.
-6. Any logged-in browser can download the result from the Render UI.
+6. Any logged-in browser can download `results.zip` from the Render UI.
 
 `openclaw` is only a donor for already configured Google OAuth/keys. The worker does not call the OpenClaw gateway.
 
-During testing, jobs use the default Drive folder owned by Maksym. A user can switch to their own Google Drive from the UI. That switch is one-way: after successful personal Drive authorization, new jobs for that email no longer use the default test folder, and the UI does not offer a way back to Maksym's Drive.
+During testing, jobs use the default Drive folder owned by Maksym. A user can switch to one selected folder in their own Google Drive from the UI. That switch is one-way: after successful personal Drive authorization, new jobs for that email no longer use the default test folder, and the UI does not offer a way back to Maksym's Drive.
+
+The visible model list is local-only by default: Qwen, Gemma 4 E2B Q4, and Gemma 4 E4B Q4 are active. Paid cloud models may still appear in the catalog, but they stay disabled unless explicitly enabled by environment variables.
 
 Personal LLM settings are prepared as hidden API plumbing, but they are not shown in the UI yet.
 
+## Dataset Jobs
+
+The task form accepts files, archives, or a whole folder. Multiple selected files or a selected folder are packed as `dataset.zip` before storage so the worker receives a single dataset archive. A single uploaded archive (`.zip`, `.7z`, `.rar`, `.tar`, `.tar.gz`, `.tgz`, `.gz`, `.bz2`, `.xz`) is stored as-is. Worker output is always returned as `results.zip`.
+
+## Translation Jobs
+
+All document translation jobs must use an XLIFF roundtrip. When the prompt asks to translate/localize uploaded documents, the worker marks the task as XLIFF-required and injects a strict policy into the Continue run:
+
+- Convert/extract each source document to XLIFF.
+- Translate only XLIFF targets/trans-units while preserving tags, IDs, placeholders, numbers, and locked terms.
+- Audit/repair the translated XLIFF.
+- Reconstruct the final document from translated XLIFF and return it in `results.zip`.
+
+Do not translate DOCX, PDF, XLSX, PPTX, HTML, or XML by directly reading document text and writing a translated document with generic Python libraries. Python libraries may be used only for XLIFF conversion, reconstruction, and validation.
+
+Reference local implementation:
+
+```text
+C:\codex\agent_pipeline_translator_semantic_tuned_clean_core_v2_targetlock_allxml_onepass_fixed_pdf_mixed_pause_reload_new_relaod_LM_PROMPT_TAGS_STRICTEST_NUMERIC_TOC_TERMLOCK_TEST_P4_P8_POST_BATCH_AUDIT_CLEAN_UI_BATCH_A (2).py
+```
+
 ## Required Render Environment
 
-- `XAI_API_KEY`
 - `SESSION_SECRET`
 - `SMTP_HOST`
 - `SMTP_PORT`
@@ -29,6 +51,7 @@ Personal LLM settings are prepared as hidden API plumbing, but they are not show
 - `SMTP_FROM`
 - `OTP_EMAIL`
 - `REMOTE_WORKER_TOKEN`
+- `REMOTE_ACTIVE_MODEL_IDS`
 - `GOOGLE_DRIVE_FOLDER_ID`
 - `GOOGLE_DRIVE_AUTH_MODE`
 - `GOOGLE_DRIVE_CONNECT_ENABLED`
@@ -66,7 +89,7 @@ The UI shows an optional `Use my Drive` control. By default, files go to:
 1WGbLfKoL8bYEi6fIXI2ktBPZmwAe86Pj
 ```
 
-After the user connects their own Drive, Render creates a folder named `Continue Render Agent` in that Drive, stores the OAuth token encrypted with `SESSION_SECRET`, and routes new task metadata, inputs, and outputs to that personal folder. Old default-folder jobs are no longer listed for that user.
+After the user connects their own Drive, Render verifies the folder URL/ID they entered, stores that selected folder ID plus the OAuth token encrypted with `SESSION_SECRET`, and routes new task metadata, inputs, and outputs only to that personal folder. Old default-folder jobs are no longer listed for that user.
 
 To enable it later:
 
@@ -83,6 +106,12 @@ Hidden endpoints:
 - `GET /api/drive/profile`
 - `POST /api/drive/connect/start`
 - `GET /api/drive/callback`
+
+`POST /api/drive/connect/start` expects a JSON body such as:
+
+```json
+{ "folder": "https://drive.google.com/drive/folders/..." }
+```
 
 ## Personal LLM Profiles
 
@@ -138,11 +167,27 @@ Defaults:
 
 Optional worker env vars:
 
-- `REMOTE_WORKER_PROVIDER=qwen|grok-build|grok-general`
+- `REMOTE_WORKER_PROVIDER=qwen|gemma-e2b|gemma-e4b|grok-build|grok-general`
 - `REMOTE_WORKER_MODE=auto|readonly|normal`
+- `REMOTE_WORKER_PACKAGE_RESULTS=true`
+- `REMOTE_WORKER_ACCESS_ENABLED=true|false`
+- `REMOTE_WORKER_ACCESS_FILE=C:\path\to\remote-access.enabled`
+- `XLIFF_TRANSLATOR_REFERENCE_SCRIPT=C:\path\to\translator.py`
 - `REMOTE_WORKER_CONTINUE_CONFIG=C:\path\to\continue-config.yaml`
 - `REMOTE_WORKER_TASK_ROOT=C:\path\to\remote-worker-tasks`
 - `REMOTE_WORKER_ENV_FILES=C:\path\one.env;C:\path\two.env`
+
+## Local Access Gate
+
+The local worker checks `remote-access.enabled` before claiming a new Render job. Missing file means access is allowed.
+
+```powershell
+npm run access:pause
+npm run access:allow
+npm run access:status
+```
+
+The Local Agent Control panel also exposes this as `External Access -> Allow jobs / Pause jobs`. Pausing does not kill a currently running job; it prevents new external jobs from being claimed while the owner uses the laptop for personal Continue work.
 
 ## Local Smoke Test
 
@@ -162,4 +207,4 @@ http://localhost:3000
 
 Render free web services have ephemeral filesystems. Google Drive storage is the durable layer for remote document jobs.
 
-The direct chat panel still runs inside Render. The document jobs panel is for local laptop execution through direct Continue.
+The direct chat panel is disabled by default for the local-only test. The document jobs panel is for local laptop execution through direct Continue.

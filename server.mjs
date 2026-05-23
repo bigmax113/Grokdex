@@ -25,8 +25,58 @@ const llmProfilesFile = path.join(__dirname, "sessions", "llm-profiles.json");
 const remoteJobsDir = path.join(__dirname, "remote-jobs");
 const defaultGoogleDriveFolderId = "1WGbLfKoL8bYEi6fIXI2ktBPZmwAe86Pj";
 const remoteWorkerToken = process.env.REMOTE_WORKER_TOKEN || "";
-const remoteFileLimitBytes = Number(process.env.REMOTE_FILE_LIMIT_BYTES || 25 * 1024 * 1024);
-const remoteTotalLimitBytes = Number(process.env.REMOTE_TOTAL_LIMIT_BYTES || 80 * 1024 * 1024);
+const remoteFileLimitBytes = Number(process.env.REMOTE_FILE_LIMIT_BYTES || 100 * 1024 * 1024);
+const remoteTotalLimitBytes = Number(process.env.REMOTE_TOTAL_LIMIT_BYTES || 250 * 1024 * 1024);
+const remoteAllowPersonalLlm = String(process.env.REMOTE_ALLOW_PERSONAL_LLM || "false").toLowerCase() === "true";
+const renderDirectAgentEnabled = String(process.env.ENABLE_RENDER_DIRECT_AGENT || "false").toLowerCase() === "true";
+const remoteModelCatalog = [
+  {
+    id: "qwen",
+    name: "LM Studio Qwen 3.6 35B A3B",
+    provider: "lmstudio",
+    model: "qwen/qwen3.6-35b-a3b",
+    contextLength: 262144,
+    maxTokens: 20000,
+  },
+  {
+    id: "gemma-e2b",
+    name: "LM Studio Gemma 4 E2B Q4",
+    provider: "lmstudio",
+    model: "google/gemma-4-e2b",
+    contextLength: 131072,
+    maxTokens: 8192,
+  },
+  {
+    id: "gemma-e4b",
+    name: "LM Studio Gemma 4 E4B Q4",
+    provider: "lmstudio",
+    model: "google/gemma-4-e4b",
+    contextLength: 131072,
+    maxTokens: 8192,
+  },
+  {
+    id: "grok-build",
+    name: "Grok Build 0.1",
+    provider: "xai",
+    model: "grok-build-0.1",
+    contextLength: 131072,
+    maxTokens: 8192,
+  },
+  {
+    id: "grok-general",
+    name: "Grok 4.3 long context",
+    provider: "xai",
+    model: "grok-4.3",
+    contextLength: 1000000,
+    maxTokens: 20000,
+  },
+];
+const remoteActiveModelIds = new Set(
+  String(process.env.REMOTE_ACTIVE_MODEL_IDS || "qwen,gemma-e2b,gemma-e4b")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 const googleDriveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID || defaultGoogleDriveFolderId;
 const googleDriveAuthMode = String(process.env.GOOGLE_DRIVE_AUTH_MODE || "").trim().toLowerCase();
 const googleServiceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
@@ -426,6 +476,149 @@ function safeFileName(name) {
     .slice(0, 160) || "file";
 }
 
+function safeRelativePath(name) {
+  const parts = String(name || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part) => safeFileName(part))
+    .filter((part) => part && part !== "." && part !== "..");
+  return parts.length ? parts.join("/") : "file";
+}
+
+function isArchiveName(name) {
+  return /\.(zip|7z|rar|tar|tgz|tar\.gz|gz|bz2|xz)$/i.test(String(name || ""));
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { dosTime, dosDate };
+}
+
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function zipFilesBuffer(files) {
+  const chunks = [];
+  const central = [];
+  const { dosTime, dosDate } = dosDateTime();
+  let offset = 0;
+
+  for (const file of files) {
+    const name = safeRelativePath(file.relativePath || file.name);
+    const nameBuffer = Buffer.from(name, "utf8");
+    const body = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || "");
+    const checksum = crc32(body);
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(dosTime, 10);
+    localHeader.writeUInt16LE(dosDate, 12);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(body.length, 18);
+    localHeader.writeUInt32LE(body.length, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(dosTime, 12);
+    centralHeader.writeUInt16LE(dosDate, 14);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(body.length, 20);
+    centralHeader.writeUInt32LE(body.length, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    chunks.push(localHeader, nameBuffer, body);
+    central.push(centralHeader, nameBuffer);
+    offset += localHeader.length + nameBuffer.length + body.length;
+  }
+
+  const centralSize = central.reduce((sum, item) => sum + item.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...chunks, ...central, end]);
+}
+
+function packageDatasetIfNeeded(files) {
+  if (files.length === 1 && isArchiveName(files[0].name)) return files;
+  if (files.length <= 1 && !files.some((file) => String(file.relativePath || "").includes("/"))) return files;
+  const buffer = zipFilesBuffer(files);
+  if (buffer.length > remoteTotalLimitBytes) throw new Error("Packed dataset archive is too large");
+  return [{
+    name: "dataset.zip",
+    relativePath: "dataset.zip",
+    mime: "application/zip",
+    buffer,
+  }];
+}
+
+function publicRemoteModel(model) {
+  return {
+    id: model.id,
+    name: model.name,
+    provider: model.provider,
+    model: model.model,
+    contextLength: model.contextLength,
+    maxTokens: model.maxTokens,
+    active: remoteActiveModelIds.has(model.id),
+  };
+}
+
+function remoteModelForRequest(value) {
+  const id = String(value || "qwen").trim() || "qwen";
+  const model = remoteModelCatalog.find((item) => item.id === id);
+  if (!model) throw new Error(`Unknown model: ${id}`);
+  if (!remoteActiveModelIds.has(model.id)) {
+    throw new Error(`${model.name} is visible but disabled for the local-only test`);
+  }
+  return model;
+}
+
+function hasTranslationIntent(text) {
+  return /\b(translate|translation|translated|locali[sz]e|locali[sz]ation)\b|перевод|перевести|переведи|локализ/i.test(String(text || ""));
+}
+
+function uploadLooksLikeDocument(input) {
+  const name = String(input?.relativePath || input?.path || input?.name || "").toLowerCase();
+  return /\.(docx?|pdf|pptx?|xlsx?|odt|ods|odp|rtf|html?|xml|xlf|xliff|zip|7z|rar|tar|tgz|gz|bz2|xz)$/.test(name);
+}
+
 function normalizedEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -532,6 +725,7 @@ function publicDriveProfile(profile) {
     email: profile.email,
     folderId: connected ? profile.folderId : googleDriveFolderId,
     folderName: profile.folderName || googleDriveProfileFolderName,
+    folderUrl: profile.folderUrl || null,
     defaultDisabledAt: profile.defaultDriveDisabledAt || null,
     connectedAt: profile.connectedAt || null,
     updatedAt: profile.updatedAt || null,
@@ -867,6 +1061,21 @@ function driveRedirectUri(req) {
   return `${proto}://${req.headers.host}/api/drive/callback`;
 }
 
+function parseDriveFolderId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const fromPath = parsed.pathname.match(/\/folders\/([^/?#]+)/i)?.[1];
+    if (fromPath) return decodeURIComponent(fromPath);
+    const fromQuery = parsed.searchParams.get("id");
+    if (fromQuery) return fromQuery.trim();
+  } catch {
+    // Raw folder IDs are accepted below.
+  }
+  return raw.match(/^[-\w]{10,}$/) ? raw : "";
+}
+
 function assertDriveConnectReady() {
   if (!googleDriveConnectEnabled) throw new Error("Personal Google Drive connect is disabled");
   if (!hasGoogleOAuthClientCredentials()) throw new Error("Google Drive OAuth client is not configured");
@@ -893,7 +1102,19 @@ async function handleDriveProfile(req, res) {
 async function handleDriveConnectStart(req, res) {
   const session = requireSession(req, res);
   if (!session) return;
-  assertDriveConnectReady();
+  try {
+    assertDriveConnectReady();
+  } catch (error) {
+    json(res, 400, { error: error.message });
+    return;
+  }
+  const body = await readBody(req);
+  const folderInput = String(body.folderId || body.folderUrl || body.folder || "").trim();
+  const folderId = parseDriveFolderId(folderInput);
+  if (!folderId) {
+    json(res, 400, { error: "Google Drive folder URL or ID is required" });
+    return;
+  }
   const { google } = await import("googleapis");
   const clientSource = parseGoogleOAuthClient();
   const client = clientSource.installed || clientSource.web || clientSource;
@@ -903,6 +1124,8 @@ async function handleDriveConnectStart(req, res) {
   driveConnectStates.set(state, {
     email: normalizedEmail(session.email),
     redirectUri,
+    folderId,
+    folderInput,
     expiresAt: Date.now() + googleDriveProfileStateTtlMs,
   });
   const authUrl = authClient.generateAuthUrl({
@@ -944,21 +1167,31 @@ async function handleDriveCallback(req, res, url) {
   const tokens = tokenResponse.tokens || {};
   authClient.setCredentials(tokens);
   const drive = google.drive({ version: "v3", auth: authClient });
-  const folder = await drive.files.create({
-    requestBody: {
-      name: googleDriveProfileFolderName,
-      mimeType: "application/vnd.google-apps.folder",
-    },
-    fields: "id,name,webViewLink",
-    supportsAllDrives: true,
-  });
+  let folder;
+  try {
+    const folderResponse = await drive.files.get({
+      fileId: pending.folderId,
+      fields: "id,name,mimeType,webViewLink",
+      supportsAllDrives: true,
+    });
+    folder = folderResponse.data;
+    if (folder.mimeType !== "application/vnd.google-apps.folder") {
+      throw new Error("Selected Google Drive item is not a folder");
+    }
+  } catch (error) {
+    driveConnectStates.delete(state);
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end(`Cannot use selected Google Drive folder: ${error.message}`);
+    return;
+  }
 
   await upsertDriveProfile({
     email: pending.email,
     authMode: "oauth",
-    folderId: folder.data.id,
-    folderName: folder.data.name || googleDriveProfileFolderName,
-    folderUrl: folder.data.webViewLink || null,
+    folderId: folder.id,
+    folderName: folder.name || googleDriveProfileFolderName,
+    folderUrl: folder.webViewLink || null,
+    folderInput: pending.folderInput,
     tokenCipher: encryptSecret(JSON.stringify(tokens)),
     defaultDriveDisabledAt: new Date().toISOString(),
     connectedAt: new Date().toISOString(),
@@ -1169,16 +1402,20 @@ function publicRemoteTask(task) {
     error: task.error || null,
     workerId: task.workerId || null,
     storage: task.storage || { mode: "default", ownerEmail: task.ownerEmail || null },
+    model: task.model ? publicRemoteModel(task.model) : publicRemoteModel(remoteModelCatalog[0]),
+    pipeline: task.pipeline || { xliffTranslationRequired: false },
     logs: Array.isArray(task.logs) ? task.logs.slice(-80) : [],
     files: (task.files || []).map((file) => ({
       id: file.id,
       name: file.name,
+      relativePath: file.relativePath || file.name,
       mime: file.mime,
       size: file.size,
     })),
     resultFiles: (task.resultFiles || []).map((file) => ({
       id: file.id,
       name: file.name,
+      relativePath: file.relativePath || file.name,
       mime: file.mime,
       size: file.size,
       downloadUrl: `/api/remote/tasks/${encodeURIComponent(task.id)}/download?file=${encodeURIComponent(file.id)}`,
@@ -1252,13 +1489,14 @@ function requireWorker(req, res) {
 
 function decodeUploadFile(input, runningTotal) {
   const name = safeFileName(input?.name);
+  const relativePath = safeRelativePath(input?.relativePath || input?.path || input?.name || name);
   const mime = String(input?.mime || "application/octet-stream").slice(0, 120);
   const base64 = String(input?.base64 || "");
   const buffer = Buffer.from(base64, "base64");
   if (!buffer.length) throw new Error(`File is empty: ${name}`);
   if (buffer.length > remoteFileLimitBytes) throw new Error(`File is too large: ${name}`);
   if (runningTotal + buffer.length > remoteTotalLimitBytes) throw new Error("Task upload is too large");
-  return { name, mime, buffer };
+  return { name, relativePath, mime, buffer };
 }
 
 async function handleRemoteTaskCreate(req, res) {
@@ -1267,13 +1505,22 @@ async function handleRemoteTaskCreate(req, res) {
   const body = await readBody(req);
   const prompt = String(body.prompt || "").trim();
   const uploads = Array.isArray(body.files) ? body.files : [];
+  let selectedModel;
+  try {
+    selectedModel = remoteModelForRequest(body.model || body.provider);
+  } catch (error) {
+    json(res, 400, { error: error.message });
+    return;
+  }
   if (!prompt && !uploads.length) {
     json(res, 400, { error: "Prompt or at least one file is required" });
     return;
   }
+  const xliffTranslationRequired = hasTranslationIntent(prompt)
+    && (!uploads.length || uploads.some(uploadLooksLikeDocument));
   const id = remoteTaskId();
   const selectedStorage = await ownerStorage(session.email);
-  const llmProfile = await getLlmProfile(session.email);
+  const llmProfile = remoteAllowPersonalLlm ? await getLlmProfile(session.email) : null;
   const storage = selectedStorage.mode === "personal"
     ? {
       mode: "personal",
@@ -1289,16 +1536,31 @@ async function handleRemoteTaskCreate(req, res) {
     };
 
   let totalBytes = 0;
+  const decodedUploads = [];
+  let preparedUploads;
+  try {
+    for (const upload of uploads) {
+      const decoded = decodeUploadFile(upload, totalBytes);
+      totalBytes += decoded.buffer.length;
+      decodedUploads.push(decoded);
+    }
+    preparedUploads = packageDatasetIfNeeded(decodedUploads);
+  } catch (error) {
+    json(res, 400, { error: error.message });
+    return;
+  }
   const files = [];
-  for (const [index, upload] of uploads.entries()) {
-    const decoded = decodeUploadFile(upload, totalBytes);
+  totalBytes = 0;
+  for (const [index, decoded] of preparedUploads.entries()) {
     totalBytes += decoded.buffer.length;
+    if (totalBytes > remoteTotalLimitBytes) throw new Error("Task upload is too large");
     const fileId = `in-${index + 1}-${crypto.randomBytes(4).toString("hex")}`;
     const storageName = `${fileId}-${decoded.name}`;
     const stored = await saveRemoteBlob(id, "inputs", storageName, decoded.mime, decoded.buffer, session.email);
     files.push({
       id: fileId,
       name: decoded.name,
+      relativePath: decoded.relativePath,
       mime: decoded.mime,
       size: decoded.buffer.length,
       ...stored,
@@ -1312,10 +1574,17 @@ async function handleRemoteTaskCreate(req, res) {
     prompt,
     ownerEmail: session.email,
     storage,
+    model: selectedModel,
     llmProfile: publicLlmProfile(llmProfile),
+    pipeline: {
+      xliffTranslationRequired,
+    },
     files,
     resultFiles: [],
-    logs: [{ at: now, message: `Task created using ${storage.mode === "personal" ? "personal Google Drive" : useDriveStorage() ? "default Google Drive" : "local Render filesystem"} storage` }],
+    logs: [{
+      at: now,
+      message: `Task created for ${selectedModel.name} using ${storage.mode === "personal" ? "personal Google Drive" : useDriveStorage() ? "default Google Drive" : "local Render filesystem"} storage${xliffTranslationRequired ? " with XLIFF translation pipeline required" : ""}`,
+    }],
     createdAt: now,
     updatedAt: now,
   };
@@ -1378,6 +1647,7 @@ async function handleWorkerNext(req, res) {
     files.push({
       id: file.id,
       name: file.name,
+      relativePath: file.relativePath || file.name,
       mime: file.mime,
       size: file.size,
       base64: buffer.toString("base64"),
@@ -1388,7 +1658,9 @@ async function handleWorkerNext(req, res) {
       id: task.id,
       prompt: task.prompt,
       createdAt: task.createdAt,
+      model: task.model || remoteModelForRequest("qwen"),
       llmProfile: workerLlmProfile(llmProfile),
+      pipeline: task.pipeline || { xliffTranslationRequired: false },
       files,
     },
   });
@@ -1437,6 +1709,7 @@ async function handleWorkerComplete(req, res, id) {
     resultFiles.push({
       id: fileId,
       name: decoded.name,
+      relativePath: decoded.relativePath,
       mime: decoded.mime,
       size: decoded.buffer.length,
       ...stored,
@@ -1541,6 +1814,10 @@ async function handleAgent(req, res) {
   const prompt = String(body.prompt || "").trim();
   if (!prompt) {
     json(res, 400, { error: "Prompt is required" });
+    return;
+  }
+  if (!renderDirectAgentEnabled) {
+    json(res, 403, { error: "Direct Render agent is disabled for the local-only test. Create a document/dataset job so the local worker handles it." });
     return;
   }
   if (!process.env.XAI_API_KEY) {
@@ -1695,6 +1972,7 @@ const server = http.createServer(async (req, res) => {
         email: session.email,
         workspace,
         xaiKey: Boolean(process.env.XAI_API_KEY),
+        directAgentEnabled: renderDirectAgentEnabled,
         smtp: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
         repo: process.env.WORKSPACE_REPO_URL || null,
         activeRuns: activeRuns.size,
@@ -1708,6 +1986,8 @@ const server = http.createServer(async (req, res) => {
           driveConnectEnabled: googleDriveConnectEnabled,
           usePersonalProfiles: googleDriveUsePersonalProfiles,
           ownerResourceFallbackEnabled,
+          allowPersonalLlm: remoteAllowPersonalLlm,
+          models: remoteModelCatalog.map(publicRemoteModel),
         },
       });
     }

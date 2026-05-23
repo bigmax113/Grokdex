@@ -16,6 +16,8 @@ services:
         generateValue: true
       - key: XAI_API_KEY
         sync: false
+      - key: ENABLE_RENDER_DIRECT_AGENT
+        value: "false"
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
@@ -35,9 +37,13 @@ services:
       - key: REMOTE_WORKER_TOKEN
         sync: false
       - key: REMOTE_FILE_LIMIT_BYTES
-        value: 26214400
+        value: 104857600
       - key: REMOTE_TOTAL_LIMIT_BYTES
-        value: 83886080
+        value: 262144000
+      - key: REMOTE_ACTIVE_MODEL_IDS
+        value: qwen,gemma-e2b,gemma-e4b
+      - key: REMOTE_ALLOW_PERSONAL_LLM
+        value: "false"
       - key: GOOGLE_DRIVE_FOLDER_ID
         value: 1WGbLfKoL8bYEi6fIXI2ktBPZmwAe86Pj
       - key: GOOGLE_DRIVE_AUTH_MODE

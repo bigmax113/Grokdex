@@ -57,18 +57,36 @@
             <div class="storageBox">
               <div>
                 <div id="driveProfile" class="storageTitle">Storage</div>
-                <div class="muted">Switching to your Drive is permanent for future jobs.</div>
+                <div class="muted">Choose one Drive folder for future jobs.</div>
               </div>
               <button id="connectDrive" type="button">Use my Drive</button>
             </div>
+            <label>
+              Drive folder URL or ID
+              <input id="driveFolder" type="text" placeholder="https://drive.google.com/drive/folders/..." />
+            </label>
             <form id="remoteTaskForm" class="remoteForm">
               <label>
                 Task
                 <textarea id="remotePrompt" rows="4" placeholder="Translate, analyze, extract, convert..."></textarea>
               </label>
               <label>
-                Files
+                Local model
+                <select id="remoteModel">
+                  <option value="qwen">LM Studio Qwen</option>
+                  <option value="gemma-e2b">LM Studio Gemma 4 E2B Q4</option>
+                  <option value="gemma-e4b">LM Studio Gemma 4 E4B Q4</option>
+                  <option value="grok-build" disabled>Grok Build 0.1 (disabled)</option>
+                  <option value="grok-general" disabled>Grok 4.3 (disabled)</option>
+                </select>
+              </label>
+              <label>
+                Files or archives
                 <input id="remoteFiles" type="file" multiple />
+              </label>
+              <label>
+                Folder as dataset
+                <input id="remoteFolder" type="file" multiple webkitdirectory directory />
               </label>
               <button id="createRemoteTask" type="submit">Create job</button>
             </form>

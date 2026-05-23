@@ -5,3 +5,4 @@ sessions/
 logs/
 remote-jobs/
 remote-worker-tasks/
+remote-access.enabled

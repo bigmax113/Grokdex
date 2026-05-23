@@ -55,7 +55,8 @@ async function refreshMe() {
 
 async function refreshStatus() {
   const status = await api("/api/status");
-  $("runtime").textContent = `${status.email} - ${status.workspace} - XAI ${status.xaiKey ? "ready" : "missing"} - SMTP ${status.smtp ? "ready" : "missing"}`;
+  const activeModels = (status.remote?.models || []).filter((model) => model.active).map((model) => model.id).join(", ");
+  $("runtime").textContent = `${status.email} - ${status.workspace} - local models: ${activeModels || "none"} - SMTP ${status.smtp ? "ready" : "missing"}`;
 }
 
 async function sendCode() {
@@ -170,23 +171,35 @@ async function refreshDriveProfile() {
     $("driveProfile").textContent = `Using your Drive: ${active.folderName || active.folderId}`;
     button.textContent = "Connected";
     button.disabled = true;
+    $("driveFolder").value = active.folderUrl || active.folderId || "";
+    $("driveFolder").disabled = true;
     return;
   }
   if (active.mode === "personal_required") {
     $("driveProfile").textContent = "Your Drive is required";
     button.textContent = "Connect Drive";
     button.disabled = !data.connectEnabled;
+    $("driveFolder").disabled = !data.connectEnabled;
     return;
   }
   $("driveProfile").textContent = "Using default test Drive";
   button.textContent = "Use my Drive";
   button.disabled = !data.connectEnabled;
+  $("driveFolder").disabled = !data.connectEnabled;
 }
 
 async function connectDrive() {
+  const folder = $("driveFolder").value.trim();
+  if (!folder) {
+    setRemoteStatus("Paste a Google Drive folder URL or folder ID first.");
+    return;
+  }
   setRemoteStatus("Preparing Google Drive authorization...");
   try {
-    const data = await api("/api/drive/connect/start", { method: "POST", body: "{}" });
+    const data = await api("/api/drive/connect/start", {
+      method: "POST",
+      body: JSON.stringify({ folder }),
+    });
     window.open(data.authUrl, "_blank", "noopener,noreferrer");
     setRemoteStatus("Google authorization opened. Refresh after approval.");
   } catch (error) {
@@ -209,7 +222,10 @@ function fileToBase64(file) {
 async function createRemoteTask(event) {
   event.preventDefault();
   const prompt = $("remotePrompt").value.trim();
-  const selected = Array.from($("remoteFiles").files || []);
+  const selected = [
+    ...Array.from($("remoteFiles").files || []),
+    ...Array.from($("remoteFolder").files || []),
+  ];
   if (!prompt && !selected.length) return;
 
   $("createRemoteTask").disabled = true;
@@ -219,16 +235,18 @@ async function createRemoteTask(event) {
     for (const file of selected) {
       files.push({
         name: file.name,
+        relativePath: file.webkitRelativePath || file.name,
         mime: file.type || "application/octet-stream",
         base64: await fileToBase64(file),
       });
     }
     await api("/api/remote/tasks", {
       method: "POST",
-      body: JSON.stringify({ prompt, files }),
+      body: JSON.stringify({ prompt, model: $("remoteModel").value, files }),
     });
     $("remotePrompt").value = "";
     $("remoteFiles").value = "";
+    $("remoteFolder").value = "";
     setRemoteStatus("Job created.");
     await refreshRemoteTasks();
   } catch (error) {
@@ -241,7 +259,9 @@ async function createRemoteTask(event) {
 function renderTask(task) {
   const statusClass = `status-${escapeHtml(task.status)}`;
   const created = task.createdAt ? new Date(task.createdAt).toLocaleString() : "";
-  const inputs = (task.files || []).map((file) => `<span>${escapeHtml(file.name)} (${formatBytes(file.size)})</span>`).join("");
+  const model = task.model?.name ? `<div class="muted">Model: ${escapeHtml(task.model.name)}</div>` : "";
+  const pipeline = task.pipeline?.xliffTranslationRequired ? `<div class="muted">Pipeline: XLIFF translation required</div>` : "";
+  const inputs = (task.files || []).map((file) => `<span>${escapeHtml(file.relativePath || file.name)} (${formatBytes(file.size)})</span>`).join("");
   const results = (task.resultFiles || [])
     .map((file) => `<a href="${file.downloadUrl}">${escapeHtml(file.name)} (${formatBytes(file.size)})</a>`)
     .join("");
@@ -254,6 +274,8 @@ function renderTask(task) {
       </div>
       <p>${escapeHtml(task.prompt || "No prompt")}</p>
       <div class="muted">${escapeHtml(created)}${task.workerId ? ` - ${escapeHtml(task.workerId)}` : ""}</div>
+      ${model}
+      ${pipeline}
       ${inputs ? `<div class="chips">${inputs}</div>` : ""}
       ${task.error ? `<div class="taskError">${escapeHtml(task.error)}</div>` : ""}
       ${results ? `<div class="results">${results}</div>` : ""}

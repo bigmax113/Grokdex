@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node server.mjs",
     "worker": "node local-worker.mjs",
-    "check": "node --check server.mjs && node --check local-worker.mjs"
+    "check": "node --check server.mjs && node --check local-worker.mjs",
+    "access:allow": "powershell -ExecutionPolicy Bypass -File ./allow-remote-access.ps1",
+    "access:pause": "powershell -ExecutionPolicy Bypass -File ./pause-remote-access.ps1",
+    "access:status": "powershell -ExecutionPolicy Bypass -File ./remote-access-status.ps1"
   },
   "dependencies": {
     "@continuedev/cli": "^1.5.45",
